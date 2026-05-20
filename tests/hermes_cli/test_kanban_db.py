@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+
 import time
 import types
 import unittest.mock
@@ -507,6 +508,86 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 
 
 
+# ---------------------------------------------------------------------------
+# Archive workspace cleanup (local: worktree-preserving archive_task)
+# ---------------------------------------------------------------------------
+
+def _init_git_repo_with_origin(repo: Path) -> None:
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True, check=True)
+    (repo / "README.md").write_text("# Test Repo\n")
+    subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=repo, capture_output=True, check=True)
+
+
+def test_archive_task_removes_scratch_workspace(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="scratch cleanup")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+        (ws / "artifact.txt").write_text("leftover")
+        assert ws.exists()
+        assert kb.archive_task(conn, tid) is True
+    assert not ws.exists()
+
+
+def test_archive_task_keeps_worktree_with_unpushed_commits(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo_with_origin(repo)
+    wt_path = tmp_path / "repo-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", str(wt_path), "-b", "feat/test-cleanup", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    )
+    (wt_path / "feature.txt").write_text("hello\n")
+    subprocess.run(["git", "add", "feature.txt"], cwd=wt_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "feature work"], cwd=wt_path, capture_output=True, check=True)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="worktree cleanup",
+            workspace_kind="worktree",
+            workspace_path=str(wt_path),
+        )
+        assert kb.archive_task(conn, tid) is True
+    assert wt_path.exists()
+
+
+def test_archive_task_removes_worktree_when_no_unpushed_commits(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo_with_origin(repo)
+    wt_path = tmp_path / "repo-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", str(wt_path), "-b", "feat/test-cleanup", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="worktree cleanup",
+            workspace_kind="worktree",
+            workspace_path=str(wt_path),
+        )
+        assert kb.archive_task(conn, tid) is True
+    assert not wt_path.exists()
+    branches = subprocess.run(
+        ["git", "branch", "--list", "feat/test-cleanup"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert not branches.stdout.strip()
+
 
 # ---------------------------------------------------------------------------
 # Workspace resolution
@@ -797,6 +878,14 @@ class TestSharedBoardPaths:
         # never one inherited from whatever the gateway last routed.
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
+        linked_project_home = (
+            tmp_path / "Documents" / "hermes-projects" / "active" / "default"
+        )
+        linked_project_home.mkdir(parents=True)
+        monkeypatch.setenv(
+            "HERMES_PROJECTS_ROOT",
+            str(tmp_path / "Documents" / "hermes-projects"),
+        )
         self._set_home(monkeypatch, tmp_path, default_home)
 
         from gateway import session_context as sc
@@ -842,6 +931,7 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
             default_home / "kanban" / "workspaces"
         )
+        assert env["HERMES_KANBAN_PROJECT_HOME"] == str(linked_project_home)
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
         for key in sc._VAR_MAP:

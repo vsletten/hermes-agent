@@ -29,6 +29,7 @@ class FakeClient:
     def __init__(self, *, codex_bin: str = "codex", codex_home=None) -> None:
         self.codex_bin = codex_bin
         self.codex_home = codex_home
+        self.initialize_kwargs: dict[str, Any] | None = None
         self.requests: list[tuple[str, dict]] = []
         self.notifications_responses: list[dict] = []
         self.responses: list[tuple[Any, dict]] = []
@@ -41,6 +42,7 @@ class FakeClient:
 
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
+        self.initialize_kwargs = dict(kwargs)
         self._initialized = True
         return {"userAgent": "fake/0.0.0", "codexHome": "/tmp",
                 "platformOs": "linux", "platformFamily": "unix"}
@@ -161,6 +163,24 @@ class TestLifecycle:
         # thread/start should be called exactly once
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
+
+    def test_initialize_enables_experimental_api_and_registers_dynamic_tools(self, monkeypatch):
+        client = FakeClient()
+        monkeypatch.setattr(
+            session_mod,
+            "_build_dynamic_tools",
+            lambda: [{"name": "kanban_complete", "description": "Complete a kanban task", "inputSchema": {"type": "object"}}],
+        )
+        s = make_session(client)
+        s.ensure_started()
+        assert client.initialize_kwargs == {
+            "client_name": "hermes",
+            "client_title": "Hermes Agent",
+            "client_version": session_mod._get_hermes_version(),
+            "capabilities": {"experimentalApi": True},
+        }
+        _method, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["dynamicTools"][0]["name"] == "kanban_complete"
 
     def test_thread_start_passes_cwd_only(self):
         """thread/start carries cwd. We intentionally do NOT pass `permissions`
@@ -506,6 +526,73 @@ class TestCompactThread:
 
 class TestServerRequestRouting:
 
+
+    def test_dynamic_tool_call_dispatches_via_handle_function_call(self, monkeypatch):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/tool/call",
+            request_id="tool-1",
+            threadId="t",
+            turnId="tu1",
+            callId="call-1",
+            tool="kanban_complete",
+            arguments={"task_id": "t_123", "summary": "done"},
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        captured: dict[str, Any] = {}
+
+        def fake_handle(tool_name, tool_args):
+            captured["tool_name"] = tool_name
+            captured["tool_args"] = tool_args
+            return '{"ok":true}'
+
+        monkeypatch.setattr("model_tools.handle_function_call", fake_handle)
+        s = make_session(client)
+        s.run_turn("hi", turn_timeout=1.0)
+        assert captured == {
+            "tool_name": "kanban_complete",
+            "tool_args": {"task_id": "t_123", "summary": "done"},
+        }
+        assert (
+            "tool-1",
+            {
+                "contentItems": [{"type": "inputText", "text": '{"ok":true}'}],
+                "success": True,
+            },
+        ) in client.responses
+
+    def test_dynamic_tool_call_failure_returns_unsuccessful_result(self, monkeypatch):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/tool/call",
+            request_id="tool-err",
+            threadId="t",
+            turnId="tu1",
+            callId="call-1",
+            tool="kanban_block",
+            arguments={"task_id": "t_123", "reason": "oops"},
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        def boom(_tool_name, _tool_args):
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr("model_tools.handle_function_call", boom)
+        s = make_session(client)
+        s.run_turn("hi", turn_timeout=1.0)
+        assert any(
+            rid == "tool-err"
+            and payload.get("success") is False
+            and "kaboom" in payload.get("contentItems", [{}])[0].get("text", "")
+            for (rid, payload) in client.responses
+        )
 
 
     def test_unknown_server_request_replied_with_error(self):
