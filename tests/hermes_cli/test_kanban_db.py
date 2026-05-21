@@ -254,6 +254,91 @@ def test_branch_name_requires_worktree_workspace(kanban_home):
         )
 
 
+def _init_git_repo_with_commit(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Hermes Tests"], cwd=path, check=True)
+    (path / "README.md").write_text("test repo\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=path, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return path
+
+
+def test_resolve_workspace_rejects_missing_declared_worktree(kanban_home, tmp_path):
+    missing = tmp_path / "worktrees" / "missing"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="missing worktree",
+            workspace_kind="worktree",
+            workspace_path=str(missing),
+            branch_name="feature/missing",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    with pytest.raises(ValueError, match="does not exist"):
+        kb.resolve_workspace(task)
+
+
+def test_resolve_workspace_accepts_existing_declared_worktree(kanban_home, tmp_path):
+    repo = _init_git_repo_with_commit(tmp_path / "repo")
+    wt = tmp_path / "worktrees" / "feature"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", "feature/ok", str(wt), "HEAD"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="existing worktree",
+            workspace_kind="worktree",
+            workspace_path=str(wt),
+            branch_name="feature/ok",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert kb.resolve_workspace(task) == wt
+
+
+def test_dispatch_blocks_missing_declared_worktree_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    missing = tmp_path / "worktrees" / "missing"
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append((task.id, workspace))
+        return 123
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="missing worktree",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(missing),
+            branch_name="feature/missing",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, tid)
+        runs = kb.list_runs(conn, task_id=tid)
+
+    assert task is not None
+    assert spawned == []
+    assert tid in res.auto_blocked
+    assert task.status == "blocked"
+    assert task.claim_lock is None
+    assert runs[-1].outcome == "blocked"
+    assert "workspace-preflight" in (runs[-1].summary or "")
+
+
 # ---------------------------------------------------------------------------
 # Links + dependency resolution
 # ---------------------------------------------------------------------------
@@ -1666,16 +1751,16 @@ def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
     assert ws.exists()
 
 
-def test_worktree_workspace_returns_intended_path(kanban_home, tmp_path):
+def test_worktree_workspace_requires_declared_existing_git_worktree(kanban_home, tmp_path):
     target = str(tmp_path / ".worktrees" / "my-task")
     with kb.connect() as conn:
         t = kb.create_task(
             conn, title="ship", workspace_kind="worktree", workspace_path=target
         )
         task = kb.get_task(conn, t)
-        ws = kb.resolve_workspace(task)
-    # We do NOT auto-create worktrees; the worker's skill handles that.
-    assert str(ws) == target
+    assert task is not None
+    with pytest.raises(ValueError, match="branch_name"):
+        kb.resolve_workspace(task)
 
 
 # ---------------------------------------------------------------------------
