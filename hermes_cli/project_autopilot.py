@@ -743,7 +743,12 @@ def sync_project_home(
         task_list = ", ".join(f"`{task_id}`" for task_id in missing_reports)
         blocker = f"missing terminal task status reports: {task_list}"
     elif doc["state"] == "BLOCKED_PROCESS" and not doc["invariant_failures"]:
-        doc["state"] = "PLANNED"
+        if doc.get("pr_url") and all(
+            node["status"] in TERMINAL_TASK_STATES for node in task_graph["nodes"]
+        ):
+            doc["state"] = "DONE"
+        else:
+            doc["state"] = "PLANNED"
     validate_project_doc(doc)
 
     (project_home / "TASKS.md").write_text(
