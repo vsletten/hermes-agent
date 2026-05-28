@@ -568,6 +568,34 @@ def render_tasks_md(doc: dict[str, Any], task_graph: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _status_next_action_body(status: str) -> str:
+    lines = status.splitlines()
+    in_section = False
+    body: list[str] = []
+    for line in lines:
+        if line.strip() == "## Next action":
+            in_section = True
+            continue
+        if in_section and line.startswith("## "):
+            break
+        if in_section:
+            body.append(line)
+    return "\n".join(body).strip()
+
+
+def _validate_status_next_action(status: str) -> None:
+    body = _status_next_action_body(status)
+    action_lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if len(action_lines) > 1:
+        raise InvariantError("STATUS.md contains multiple canonical next actions")
+
+
+def _validate_status_md(status: str) -> None:
+    if status.count("## Next action") != 1:
+        raise InvariantError("STATUS.md must contain exactly one ## Next action")
+    _validate_status_next_action(status)
+
+
 def _terminal_tasks_missing_reports_for_root(
     project_home: Path,
     nodes: list[dict[str, Any]],
@@ -607,6 +635,10 @@ def sync_project_home(
     from hermes_cli import kanban_db
 
     doc = load_project_doc_for_sync(project_home)
+    status_path = project_home / "STATUS.md"
+    if status_path.exists():
+        _validate_status_md(status_path.read_text(encoding="utf-8"))
+
     conn = kanban_db.connect(db_path, board=board or doc["board_slug"])
     try:
         graph_with_contracts = derive_task_graph(conn, doc["root_task_id"])
@@ -729,8 +761,7 @@ def verify_project_home(project_home: Path) -> dict[str, Any]:
         )
     doc = load_project_doc(project_home)
     status = (project_home / "STATUS.md").read_text(encoding="utf-8")
-    if status.count("## Next action") != 1:
-        raise InvariantError("STATUS.md must contain exactly one ## Next action")
+    _validate_status_md(status)
     if str(project_home) != doc["project_home"]:
         raise InvariantError("project.json project_home does not match actual path")
     return doc

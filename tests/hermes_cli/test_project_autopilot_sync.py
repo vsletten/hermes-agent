@@ -8,7 +8,12 @@ import pytest
 
 from hermes_cli import project_autopilot
 from hermes_cli import kanban_db
-from hermes_cli.project_autopilot import bootstrap_project_home, sync_project_home
+from hermes_cli.project_autopilot import (
+    InvariantError,
+    bootstrap_project_home,
+    sync_project_home,
+    verify_project_home,
+)
 
 
 def _bootstrap_demo_project(tmp_path, *, board_slug="demo-board"):
@@ -114,6 +119,68 @@ def test_sync_project_home_rewrites_project_files_from_board_truth(tmp_path):
         )
         assert "Reconcile `TASKS.md` and `STATUS.md` from board truth" in handoff_md
         assert "Task graph snapshot" in handoff_md
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "next_action_section",
+    [
+        "- Do A\n- Do B\n",
+        "Do A\nDo B\n",
+    ],
+)
+def test_verify_project_home_rejects_ambiguous_next_action_section(
+    tmp_path, next_action_section
+):
+    project_home = _bootstrap_demo_project(tmp_path)
+    (project_home / "STATUS.md").write_text(
+        f"# Status: Demo\n\n## Next action\n\n{next_action_section}\n"
+        "## Board tasks\n\n- no tasks cached\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InvariantError, match="multiple canonical next actions"):
+        verify_project_home(project_home)
+
+
+def test_sync_project_home_rejects_ambiguous_existing_next_action_section(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    conn = kanban_db.connect(db_path)
+    try:
+        conn.execute(
+            """
+            INSERT INTO tasks (
+                id, title, body, assignee, status, priority, created_by,
+                created_at, workspace_kind
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "t_root",
+                "Root project",
+                "Project root body",
+                "codexapp",
+                "ready",
+                0,
+                "tester",
+                1,
+                "scratch",
+            ),
+        )
+
+        project_home = _bootstrap_demo_project(tmp_path)
+        (project_home / "STATUS.md").write_text(
+            "# Status: Demo\n\n## Next action\n\n- Do A\n- Do B\n\n"
+            "## Board tasks\n\n- no tasks cached\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(InvariantError, match="multiple canonical next actions"):
+            sync_project_home(project_home, db_path=db_path)
+
+        assert "- Do A\n- Do B" in (project_home / "STATUS.md").read_text(
+            encoding="utf-8"
+        )
     finally:
         conn.close()
 
