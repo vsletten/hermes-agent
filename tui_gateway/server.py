@@ -6181,6 +6181,9 @@ def _(rid, params: dict) -> dict:
                 on_silent_limit=lambda: _voice_emit(
                     "voice.transcript", {"no_speech_limit": True}
                 ),
+                on_no_speech=lambda: _voice_emit(
+                    "voice.transcript", {"no_speech": True}
+                ),
                 silence_threshold=safe_threshold,
                 silence_duration=safe_duration,
                 auto_restart=False,

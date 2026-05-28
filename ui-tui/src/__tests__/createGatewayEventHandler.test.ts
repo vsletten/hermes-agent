@@ -132,6 +132,18 @@ describe('createGatewayEventHandler', () => {
     expect(ctx.system.sys).toHaveBeenCalledWith('compressing 968 messages (~123,400 tok)…')
   })
 
+  it('surfaces empty voice captures instead of silently ignoring them', () => {
+    const ctx = buildCtx([])
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({ payload: { no_speech: true }, type: 'voice.transcript' } as any)
+
+    expect(ctx.voice.setRecording).toHaveBeenCalledWith(false)
+    expect(ctx.voice.setProcessing).toHaveBeenCalledWith(false)
+    expect(ctx.system.sys).toHaveBeenCalledWith('voice: no speech detected')
+    expect(ctx.submission.submitRef.current).not.toHaveBeenCalled()
+  })
+
   it('keeps goal verdict text in transcript but shows a brief idle status (#goal statusbar)', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)
