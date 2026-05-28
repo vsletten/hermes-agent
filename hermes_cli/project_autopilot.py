@@ -64,6 +64,25 @@ def branch_to_worktree_path(*, worktree_namespace: Path, branch_name: str) -> Pa
     return worktree_namespace / Path(*branch.split("/"))
 
 
+def validate_workspace_contract(contract: dict[str, Any], *, repo: dict[str, Any]) -> None:
+    for key in ("task_id", "workspace_path", "branch_name", "base_ref"):
+        if not contract.get(key):
+            raise ProjectAutopilotError(f"workspace contract missing {key}")
+    if not repo.get("worktree_namespace"):
+        raise ProjectAutopilotError("workspace contract missing repo.worktree_namespace")
+
+    expected = branch_to_worktree_path(
+        worktree_namespace=Path(repo["worktree_namespace"]),
+        branch_name=contract["branch_name"],
+    )
+    actual = Path(contract["workspace_path"]).expanduser()
+    if actual != expected:
+        raise ProjectAutopilotError(
+            "workspace_path must equal branch-derived path: "
+            f"expected {expected}, got {actual}"
+        )
+
+
 def _canonical_worktree_namespace(repo_org: str, repo_name: str) -> Path:
     return Path("/Users/vsletten/src") / repo_org / repo_name
 
