@@ -50,6 +50,7 @@ hermes [global-options] <command> [subcommand/options]
 | `hermes status` | Show agent, auth, and platform status. |
 | `hermes cron` | Inspect and tick the cron scheduler. |
 | `hermes kanban` | Multi-profile collaboration board (tasks, links, dispatcher). |
+| `hermes project` | Filesystem-backed Project Autopilot homes for long-running Kanban projects. |
 | `hermes webhook` | Manage dynamic webhook subscriptions for event-driven activation. |
 | `hermes hooks` | Inspect, approve, or remove shell-script hooks declared in `config.yaml`. |
 | `hermes doctor` | Diagnose config and dependency issues. |
@@ -438,6 +439,55 @@ Board resolution order (highest precedence first): `--board <slug>` flag → `HE
 All actions are also available as a slash command in the gateway (`/kanban …`), with the same argument surface — including `boards` subcommands and the `--board` flag.
 
 For the full design — comparison with Cline Kanban / Paperclip / NanoClaw / Gemini Enterprise, eight collaboration patterns, four user stories, concurrency correctness proof — see `docs/hermes-kanban-v1-spec.pdf` in the repository or the [Kanban user guide](/docs/user-guide/features/kanban).
+
+## `hermes project`
+
+```bash
+hermes project <init|sync|verify|cleanup-inventory>
+```
+
+Manage deterministic Project Autopilot V0 project homes for long-running Kanban
+engineering projects. The project home stores lifecycle state and continuity
+files, while Kanban remains canonical for task execution.
+
+| Subcommand | Description |
+|------------|-------------|
+| `init` | Bootstrap a Project Autopilot home and seed `project.json` plus continuity docs. |
+| `verify <project_home>` | Validate schema, required files, lifecycle invariants, PR gating, and worktree path policy. |
+| `sync <project_home>` | Refresh `TASKS.md`, `STATUS.md`, `SESSION-HANDOFF.md`, and cached task graph state from Kanban. |
+| `cleanup-inventory <project_home>` | Write a dry-run cleanup inventory under `artifacts/cleanup/` without deleting files. |
+
+### `hermes project init`
+
+```bash
+hermes project init \
+  --slug <slug> \
+  --title "<title>" \
+  --goal "<goal>" \
+  --board <board_slug> \
+  --root-task <task_id> \
+  --project-home <project_home> \
+  --repo-org <org> \
+  --repo-name <repo> \
+  --canonical-repo <path> \
+  --final-branch <branch> \
+  [--source-plan <path>]
+```
+
+Project Autopilot V0 supports only `stacked-slices-one-pr`. Code worktrees must
+map branch names to paths under `/Users/vsletten/src/<org>/<repo>/<branch-name-as-path>`;
+the project home itself stays under `~/Documents/hermes-projects/active/<slug>/`.
+
+Examples:
+
+```bash
+hermes project verify ~/Documents/hermes-projects/active/project-autopilot
+hermes project sync ~/Documents/hermes-projects/active/project-autopilot
+hermes project cleanup-inventory ~/Documents/hermes-projects/active/project-autopilot
+```
+
+See [Project Autopilot](/docs/user-guide/features/project-autopilot) for the
+full workflow and guardrails.
 
 ## `hermes webhook`
 
