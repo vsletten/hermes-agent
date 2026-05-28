@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.project_autopilot import (
+    InvariantError,
     PROJECT_MODE_V0,
     SUPPORTED_PROJECT_MODES,
     ProjectAutopilotError,
@@ -64,3 +65,65 @@ def test_branch_to_worktree_path_uses_victor_convention():
         worktree_namespace=Path("/Users/vsletten/src/summation/Code"),
         branch_name="kanban/fix-this-shit",
     ) == Path("/Users/vsletten/src/summation/Code/kanban/fix-this-shit")
+
+
+def test_done_state_requires_pr_url_or_victor_waiver(tmp_path):
+    doc = normalize_project_doc(
+        slug="demo",
+        title="Demo",
+        goal="Demo goal",
+        board_slug="demo",
+        root_task_id="t_root",
+        project_home=tmp_path / "demo",
+        repo_org="summation",
+        repo_name="Code",
+        canonical_checkout=Path("/Users/vsletten/src/summation/Code/main"),
+        final_branch="feat/demo-pr",
+    )
+    doc["state"] = "DONE"
+
+    with pytest.raises(
+        InvariantError,
+        match="coding project cannot be DONE without pr_url or Victor PR waiver",
+    ):
+        validate_project_doc(doc)
+
+
+def test_done_state_accepts_pr_url(tmp_path):
+    doc = normalize_project_doc(
+        slug="demo",
+        title="Demo",
+        goal="Demo goal",
+        board_slug="demo",
+        root_task_id="t_root",
+        project_home=tmp_path / "demo",
+        repo_org="summation",
+        repo_name="Code",
+        canonical_checkout=Path("/Users/vsletten/src/summation/Code/main"),
+        final_branch="feat/demo-pr",
+    )
+    doc["state"] = "DONE"
+    doc["pr_url"] = "https://github.com/NousResearch/hermes-agent/pull/123"
+
+    validate_project_doc(doc)
+
+
+def test_done_state_accepts_victor_pr_waiver(tmp_path):
+    doc = normalize_project_doc(
+        slug="demo",
+        title="Demo",
+        goal="Demo goal",
+        board_slug="demo",
+        root_task_id="t_root",
+        project_home=tmp_path / "demo",
+        repo_org="summation",
+        repo_name="Code",
+        canonical_checkout=Path("/Users/vsletten/src/summation/Code/main"),
+        final_branch="feat/demo-pr",
+    )
+    doc["state"] = "DONE"
+    doc["pr_requirement"]["waived"] = True
+    doc["pr_requirement"]["waived_by"] = "Victor"
+    doc["pr_requirement"]["reason"] = "Manual approval"
+
+    validate_project_doc(doc)

@@ -250,6 +250,16 @@ def validate_project_doc(doc: dict[str, Any]) -> None:
         raise ProjectAutopilotError(
             "V0 requires execution_policy parallelism=none max_active_workers=1"
         )
+    if doc["state"] == "DONE":
+        assert_done_preconditions(doc)
+
+
+def assert_done_preconditions(doc: dict[str, Any]) -> None:
+    pr_req = doc.get("pr_requirement") or {}
+    if pr_req.get("required", True) and not pr_req.get("waived") and not doc.get("pr_url"):
+        raise InvariantError(
+            "coding project cannot be DONE without pr_url or Victor PR waiver"
+        )
 
 
 def project_home_for_slug(slug: str) -> Path:
