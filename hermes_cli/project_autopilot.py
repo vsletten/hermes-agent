@@ -83,6 +83,22 @@ def validate_workspace_contract(contract: dict[str, Any], *, repo: dict[str, Any
         )
 
 
+def parse_patch_id_output(output: str) -> set[str]:
+    ids: set[str] = set()
+    for line in output.splitlines():
+        parts = line.split()
+        if parts:
+            ids.add(parts[0])
+    return ids
+
+
+def missing_patch_ids(
+    task_patch_ids: set[str],
+    final_patch_ids: set[str],
+) -> set[str]:
+    return task_patch_ids - final_patch_ids
+
+
 def _canonical_worktree_namespace(repo_org: str, repo_name: str) -> Path:
     return Path("/Users/vsletten/src") / repo_org / repo_name
 
