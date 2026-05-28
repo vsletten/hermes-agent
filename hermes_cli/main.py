@@ -8825,6 +8825,87 @@ def _run_pre_update_backup(args) -> None:
     print()
 
 
+def cmd_overlay(args):
+    """Manage local customization overlays."""
+    from hermes_cli import overlay
+
+    action = getattr(args, "overlay_action", None)
+    try:
+        if action == "list":
+            records = overlay.list_overlays()
+            if not records:
+                print("No overlays found.")
+                return
+            for record in records:
+                repo = f" repo={record.repo}" if record.repo else ""
+                reason = f" — {record.reason}" if record.reason else ""
+                print(f"{record.name}{repo}{reason}")
+            return
+
+        if action == "show":
+            record = overlay.get_overlay(args.name)
+            manifest = json.loads((record.path / "manifest.json").read_text(encoding="utf-8"))
+            print(json.dumps(manifest, indent=2, sort_keys=True))
+            return
+
+        if action == "capture":
+            record = overlay.capture_overlay(
+                args.name,
+                repo=Path(args.repo).expanduser() if args.repo else None,
+                files=[Path(p).expanduser() for p in (args.file or [])],
+                reason=args.reason,
+                tests=args.test or [],
+                overwrite=args.force,
+            )
+            print(f"Captured overlay: {record.name}")
+            print(f"  Path: {record.path}")
+            return
+
+        if action == "apply":
+            if args.name == "all":
+                results = overlay.apply_all_overlays(run_tests=not args.no_tests)
+            else:
+                results = [overlay.apply_overlay(args.name, run_tests=not args.no_tests)]
+            for result in results:
+                print(f"Applied overlay: {result.name}")
+                if result.repo_applied:
+                    print("  repo patch: applied")
+                for restored in result.files_restored or []:
+                    print(f"  file restored: {restored}")
+                for command in result.tests_run or []:
+                    print(f"  test passed: {command}")
+            return
+
+        if action == "status":
+            records = overlay.list_overlays()
+            print(f"{len(records)} overlay(s) stored in {overlay.overlays_root()}")
+            for record in records:
+                print(f"- {record.name}")
+            return
+
+        if action == "update":
+            if args.dry_run:
+                print("Would run: hermes update")
+                print("Would apply overlays:")
+                for record in overlay.list_overlays():
+                    print(f"- {record.name}")
+                return
+            if not args.skip_update:
+                update_cmd = [sys.executable, "-m", "hermes_cli.main", "update"]
+                if args.yes:
+                    update_cmd.append("--yes")
+                subprocess.run(update_cmd, check=True)
+            results = overlay.apply_all_overlays(run_tests=not args.no_tests)
+            for result in results:
+                print(f"Applied overlay: {result.name}")
+            return
+    except overlay.OverlayError as exc:
+        print(f"✗ {exc}")
+        sys.exit(1)
+
+    raise SystemExit("overlay subcommand required")
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -13740,6 +13821,70 @@ Examples:
     # =========================================================================
     version_parser = subparsers.add_parser("version", help="Show version information")
     version_parser.set_defaults(func=cmd_version)
+
+    # =========================================================================
+    # overlay command
+    # =========================================================================
+    overlay_parser = subparsers.add_parser(
+        "overlay",
+        help="Preserve and reapply local customizations across updates",
+        description="Manage local overlay bundles stored outside the Hermes source tree",
+    )
+    overlay_subparsers = overlay_parser.add_subparsers(dest="overlay_action")
+
+    overlay_list_parser = overlay_subparsers.add_parser("list", help="List overlays")
+    overlay_list_parser.set_defaults(func=cmd_overlay)
+
+    overlay_status_parser = overlay_subparsers.add_parser("status", help="Show overlay status")
+    overlay_status_parser.set_defaults(func=cmd_overlay)
+
+    overlay_show_parser = overlay_subparsers.add_parser("show", help="Show overlay manifest")
+    overlay_show_parser.add_argument("name", help="Overlay name")
+    overlay_show_parser.set_defaults(func=cmd_overlay)
+
+    overlay_capture_parser = overlay_subparsers.add_parser(
+        "capture",
+        help="Capture a repo diff and/or external files as an overlay",
+    )
+    overlay_capture_parser.add_argument("name", help="Overlay name")
+    overlay_capture_parser.add_argument("--repo", help="Git repo whose HEAD diff should be captured")
+    overlay_capture_parser.add_argument(
+        "--file",
+        action="append",
+        help="External file to snapshot, repeatable for venv/vendor hotfixes",
+    )
+    overlay_capture_parser.add_argument("--reason", help="Why this overlay exists")
+    overlay_capture_parser.add_argument(
+        "--test",
+        action="append",
+        help="Verification command to run after apply, repeatable",
+    )
+    overlay_capture_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace an existing overlay with the same name",
+    )
+    overlay_capture_parser.set_defaults(func=cmd_overlay)
+
+    overlay_apply_parser = overlay_subparsers.add_parser("apply", help="Apply one overlay, or 'all'")
+    overlay_apply_parser.add_argument("name", help="Overlay name, or 'all'")
+    overlay_apply_parser.add_argument(
+        "--no-tests",
+        action="store_true",
+        help="Apply without running overlay verification commands",
+    )
+    overlay_apply_parser.set_defaults(func=cmd_overlay)
+
+    overlay_update_parser = overlay_subparsers.add_parser(
+        "update",
+        help="Run hermes update, then reapply overlays",
+    )
+    overlay_update_parser.add_argument("--dry-run", action="store_true", help="Show the update/apply plan")
+    overlay_update_parser.add_argument("--skip-update", action="store_true", help="Only apply overlays")
+    overlay_update_parser.add_argument("--no-tests", action="store_true", help="Skip overlay tests")
+    overlay_update_parser.add_argument("--yes", "-y", action="store_true", help="Pass --yes to hermes update")
+    overlay_update_parser.set_defaults(func=cmd_overlay)
+    overlay_parser.set_defaults(func=cmd_overlay)
 
     # =========================================================================
     # update command
