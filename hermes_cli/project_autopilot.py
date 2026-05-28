@@ -422,6 +422,8 @@ def render_status_md(
     next_task = _find_next_executable(graph)
     if next_action:
         action = next_action
+    elif doc["state"] == "DONE" and doc.get("pr_url"):
+        action = f"Review draft PR: {doc['pr_url']}"
     elif next_task:
         action = (
             f"Next executable task: `{next_task['id']}` {next_task['title']} "

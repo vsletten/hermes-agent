@@ -9,6 +9,7 @@ from hermes_cli.project_autopilot import (
     ProjectAutopilotError,
     branch_to_worktree_path,
     normalize_project_doc,
+    render_status_md,
     validate_project_doc,
 )
 
@@ -106,6 +107,28 @@ def test_done_state_accepts_pr_url(tmp_path):
     doc["pr_url"] = "https://github.com/NousResearch/hermes-agent/pull/123"
 
     validate_project_doc(doc)
+
+
+def test_done_status_points_at_pr_review(tmp_path):
+    doc = normalize_project_doc(
+        slug="demo",
+        title="Demo",
+        goal="Demo goal",
+        board_slug="demo",
+        root_task_id="t_root",
+        project_home=tmp_path / "demo",
+        repo_org="summation",
+        repo_name="Code",
+        canonical_checkout=Path("/Users/vsletten/src/summation/Code/main"),
+        final_branch="feat/demo-pr",
+    )
+    doc["state"] = "DONE"
+    doc["pr_url"] = "https://github.com/NousResearch/hermes-agent/pull/123"
+
+    status_md = render_status_md(doc, task_graph={"nodes": [], "edges": []})
+
+    assert "Review draft PR: https://github.com/NousResearch/hermes-agent/pull/123" in status_md
+    assert "No ready or running task found" not in status_md
 
 
 def test_done_state_accepts_victor_pr_waiver(tmp_path):
