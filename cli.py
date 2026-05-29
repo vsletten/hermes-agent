@@ -12599,6 +12599,14 @@ class HermesCLI:
             _welcome_color = "#FFF8DC"
         self._console_print(f"[{_welcome_color}]{_welcome_text}[/]")
 
+        # Auto-enable voice mode if config has voice.enabled: true
+        try:
+            _voice_cfg = self.config.get("voice", {})
+            if isinstance(_voice_cfg, dict) and _voice_cfg.get("enabled", False):
+                self._enable_voice_mode()
+        except Exception:
+            pass
+
         # Redaction opt-out warning (#17691): ON by default, loud when off.
         # The redactor snapshots its state at import time so any toggle now
         # won't affect the running process — we just want the operator to
