@@ -24,9 +24,9 @@ On name collision, later sources win — a user plugin named `disk-cleanup` woul
 
 `plugins/memory/` and `plugins/context_engine/` are deliberately excluded from bundled scanning. Those directories use their own discovery paths because memory providers and context engines are single-select providers configured through `hermes memory setup` / `context.engine` in config.
 
-## Bundled plugins are opt-in
+## Runtime plugins are opt-in
 
-Bundled plugins ship disabled. Discovery finds them (they appear in `hermes plugins list` and the interactive `hermes plugins` UI), but none load until you explicitly enable them:
+Bundled plugins that add hooks, tools, slash commands, providers, or other runtime behaviour ship disabled. Discovery finds them (they appear in `hermes plugins list` and the interactive `hermes plugins` UI), but none load until you explicitly enable them:
 
 ```bash
 hermes plugins enable disk-cleanup
@@ -40,7 +40,9 @@ plugins:
     - disk-cleanup
 ```
 
-This is the same mechanism user-installed plugins use. Bundled plugins are never auto-enabled — not on fresh install, not for existing users upgrading to a newer Hermes. You always opt in explicitly.
+This is the same mechanism user-installed plugins use. Bundled runtime plugins are never auto-enabled — not on fresh install, not for existing users upgrading to a newer Hermes. You always opt in explicitly.
+
+Dashboard-only plugins are different: they register tabs from `dashboard/manifest.json` when you run `hermes dashboard`. They do not add model-visible tools or lifecycle hooks, and each plugin's section below calls out its own opt-out path when one applies.
 
 To turn a bundled plugin off again:
 
@@ -51,7 +53,7 @@ hermes plugins disable disk-cleanup
 
 ## Currently shipped
 
-The repo ships these bundled plugins under `plugins/`. All are opt-in — enable them via `hermes plugins enable <name>`.
+The repo ships these bundled plugins under `plugins/`. Runtime plugins are opt-in via `hermes plugins enable <name>`; dashboard-only plugins register with the web dashboard from their manifest.
 
 | Plugin | Kind | Purpose |
 |---|---|---|
@@ -65,8 +67,9 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 | `image_gen/xai` | image backend | xAI `grok-2-image` backend |
 | `hermes-achievements` | dashboard tab | Steam-style collectible badges generated from your real Hermes session history |
 | `kanban/dashboard` | dashboard tab | Kanban board UI for the multi-agent dispatcher — tasks, comments, fan-out, board switching. See [Kanban Multi-Agent](./kanban.md). |
+| `stack-pr` | dashboard tab + backend | Local-only Stack PR controls for viewing, submitting, landing, and abandoning a stack through the `stack-pr` CLI |
 
-Memory providers (`plugins/memory/*`) and context engines (`plugins/context_engine/*`) are listed separately on [Memory Providers](./memory-providers.md) — they're managed through `hermes memory` and `hermes plugins` respectively. The full per-plugin detail for the two long-running hooks-based plugins follows.
+Memory providers (`plugins/memory/*`) and context engines (`plugins/context_engine/*`) are listed separately on [Memory Providers](./memory-providers.md) — they're managed through `hermes memory` and `hermes plugins` respectively. The full per-plugin detail for selected bundled plugins follows.
 
 ### disk-cleanup
 
@@ -273,6 +276,26 @@ Adds a **Steam-style achievements tab to the dashboard** — 60+ collectible, ti
 **Enabling:** Nothing to enable — `hermes-achievements` is a dashboard-only plugin (no lifecycle hooks, no model-visible tools). It auto-registers as a tab in `hermes dashboard` on first launch. The `plugins.enabled` config only gates lifecycle/tool plugins; dashboard plugins are discovered purely via their `dashboard/manifest.json`.
 
 **Opting out:** Delete or rename `plugins/hermes-achievements/dashboard/manifest.json`, or override it with a user plugin of the same name in `~/.hermes/plugins/hermes-achievements/` that ships no dashboard. The plugin's state files under `$HERMES_HOME/plugins/hermes-achievements/` survive — reinstalling preserves your unlock history.
+
+### stack-pr
+
+Adds a **Stack PR tab to the dashboard** for local stacked-PR workflows. It wraps the installed `stack-pr` CLI with fixed actions: view the current stack, submit it, land it, or abandon it from a selected Git worktree.
+
+**Local-only assumptions:** this plugin is meant for a trusted local dashboard session with access to your normal `git`, `gh`, and `stack-pr` binaries. It validates that the repo path is an absolute Git worktree before invoking `stack-pr`, and it reports missing tools or repo validation failures in the tab instead of requiring `stack-pr` to be installed for Hermes itself to start.
+
+**Safety gates:** the backend never exposes an arbitrary command textbox or user-provided subcommand. It runs fixed argv lists with `shell=False`, does not switch branches, and requires confirmation before mutating actions: submit and land require `confirm=true`, while abandon requires typed `abandon` confirmation.
+
+**API** — routes mount under `/api/plugins/stack-pr/`:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /status` | Reports `git`, `gh`, and `stack-pr` availability plus optional repo-path validation |
+| `POST /view` | Runs `stack-pr view` in the validated repo and returns stdout, stderr, exit code, and parsed text |
+| `POST /submit` | Runs `stack-pr submit` only when `confirm=true` is present |
+| `POST /land` | Runs `stack-pr land` only when `confirm=true` is present |
+| `POST /abandon` | Runs `stack-pr abandon` only after typed `abandon` confirmation |
+
+**Enabling:** Nothing to enable — `stack-pr` is a dashboard-only bundled plugin. It registers from `plugins/stack-pr/dashboard/manifest.json` when you run `hermes dashboard`.
 
 ## Adding a bundled plugin
 

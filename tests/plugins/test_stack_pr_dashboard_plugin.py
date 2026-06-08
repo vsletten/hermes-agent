@@ -93,6 +93,50 @@ def test_stack_pr_dashboard_manifest_and_bundle_contract():
     assert "Switch branch" not in bundle
 
 
+def test_stack_pr_dashboard_is_discovered_as_bundled_plugin(monkeypatch):
+    from hermes_cli import web_server
+
+    monkeypatch.delenv("HERMES_ENABLE_PROJECT_PLUGINS", raising=False)
+    web_server._dashboard_plugins_cache = None
+
+    try:
+        plugins = web_server._get_dashboard_plugins(force_rescan=True)
+    finally:
+        web_server._dashboard_plugins_cache = None
+
+    stack_pr = next((plugin for plugin in plugins if plugin["name"] == "stack-pr"), None)
+    assert stack_pr is not None
+    assert stack_pr["source"] == "bundled"
+    assert stack_pr["tab"]["path"] == "/stack-pr"
+    assert stack_pr["entry"] == "dist/index.js"
+    assert stack_pr["css"] == "dist/style.css"
+    assert stack_pr["has_api"] is True
+    assert stack_pr["_api_file"] == "plugin_api.py"
+
+    dashboard_dir = Path(stack_pr["_dir"])
+    assert (dashboard_dir / stack_pr["entry"]).is_file()
+    assert (dashboard_dir / stack_pr["css"]).is_file()
+    assert (dashboard_dir / stack_pr["_api_file"]).is_file()
+
+
+def test_stack_pr_dashboard_docs_describe_safety_contract():
+    repo_root = Path(__file__).resolve().parents[2]
+    docs = (
+        repo_root
+        / "website"
+        / "docs"
+        / "user-guide"
+        / "features"
+        / "built-in-plugins.md"
+    ).read_text()
+    normalized_docs = docs.lower()
+
+    assert "`stack-pr`" in docs
+    assert "local-only" in normalized_docs
+    assert "confirm=true" in docs
+    assert "typed `abandon`" in docs
+
+
 def test_status_reports_tool_availability_and_repo_validation(client, plugin_api, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
