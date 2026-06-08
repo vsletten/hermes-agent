@@ -1,0 +1,14 @@
+{
+  "name": "stack-pr",
+  "label": "Stack PR",
+  "description": "Local dashboard controls for the stack-pr CLI with repo validation and confirmation-gated actions",
+  "icon": "GitPullRequest",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/stack-pr",
+    "position": "after:kanban",
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
