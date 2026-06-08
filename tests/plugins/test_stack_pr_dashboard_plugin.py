@@ -8,6 +8,7 @@ they do not require stack-pr to be installed.
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -52,6 +53,44 @@ def _completed(argv: list[str], returncode: int = 0, stdout: str = "", stderr: s
 
 def test_plugin_api_imports_router(plugin_api):
     assert isinstance(plugin_api.router, APIRouter)
+
+
+def test_stack_pr_dashboard_manifest_and_bundle_contract():
+    repo_root = Path(__file__).resolve().parents[2]
+    dashboard_dir = repo_root / "plugins" / "stack-pr" / "dashboard"
+    manifest = json.loads((dashboard_dir / "manifest.json").read_text())
+    bundle = (dashboard_dir / manifest["entry"]).read_text()
+
+    assert manifest["name"] == "stack-pr"
+    assert manifest["label"] == "Stack PR"
+    assert manifest["entry"] == "dist/index.js"
+    assert manifest["tab"]["path"] == "/stack-pr"
+    assert manifest["tab"].get("hidden") is not True
+    assert manifest.get("css") == "dist/style.css"
+
+    assert "window.__HERMES_PLUGIN_SDK__" in bundle
+    assert 'window.__HERMES_PLUGINS__.register("stack-pr"' in bundle
+    for endpoint in (
+        "/api/plugins/stack-pr/status",
+        "/api/plugins/stack-pr/view",
+        "/api/plugins/stack-pr/submit",
+        "/api/plugins/stack-pr/land",
+        "/api/plugins/stack-pr/abandon",
+    ):
+        assert endpoint in bundle
+
+    assert "SDK.fetchJSON" in bundle
+    assert "Confirm stack-pr submit" in bundle
+    assert "Confirm stack-pr land" in bundle
+    assert "Type abandon to confirm" in bundle
+    assert "confirm: true" in bundle
+    assert 'confirm_text: "abandon"' in bundle
+    assert "fetch(" not in bundle
+    assert "XMLHttpRequest" not in bundle
+    assert "textarea" not in bundle
+    assert "spr" not in bundle
+    assert "Arbitrary command" not in bundle
+    assert "Switch branch" not in bundle
 
 
 def test_status_reports_tool_availability_and_repo_validation(client, plugin_api, tmp_path, monkeypatch):

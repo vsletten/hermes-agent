@@ -1,0 +1,269 @@
+/*
+ * Stack PR dashboard plugin styles.
+ * Uses dashboard theme variables so it follows the active theme.
+ */
+
+.stack-pr {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  width: 100%;
+  color: var(--color-foreground);
+}
+
+.stack-pr-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.stack-pr-header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  line-height: 1.2;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.stack-pr-subtitle,
+.stack-pr-muted,
+.stack-pr-tool-path {
+  color: var(--color-muted-foreground);
+  font-size: 0.85rem;
+}
+
+.stack-pr-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(18rem, 24rem);
+  gap: 1rem;
+  align-items: start;
+}
+
+.stack-pr-main,
+.stack-pr-side {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.stack-pr-panel {
+  min-width: 0;
+  border: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-card) 88%, transparent);
+  border-radius: var(--radius, 0.5rem);
+  padding: 1rem;
+}
+
+.stack-pr-panel--muted {
+  background: color-mix(in srgb, var(--color-muted) 25%, transparent);
+}
+
+.stack-pr-panel--error {
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 60%, var(--color-border));
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 8%, var(--color-card));
+}
+
+.stack-pr-panel-head,
+.stack-pr-row,
+.stack-pr-action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.stack-pr-panel-title {
+  margin-bottom: 0.75rem;
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.stack-pr-field {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.stack-pr-field input,
+.stack-pr-abandon-field input {
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+.stack-pr-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.8rem;
+}
+
+.stack-pr-action-row {
+  padding: 0.8rem 0;
+  border-top: 1px solid color-mix(in srgb, var(--color-border) 75%, transparent);
+}
+
+.stack-pr-action-row:first-of-type {
+  border-top: 0;
+}
+
+.stack-pr-action-row--danger {
+  align-items: flex-end;
+}
+
+.stack-pr-action-name {
+  margin-bottom: 0.35rem;
+  font-weight: 650;
+}
+
+.stack-pr-abandon-field {
+  display: grid;
+  min-width: 12rem;
+  gap: 0.35rem;
+}
+
+.stack-pr-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--color-muted-foreground);
+  font-size: 0.85rem;
+}
+
+.stack-pr-check input {
+  width: 1rem;
+  height: 1rem;
+  accent-color: var(--color-primary);
+}
+
+.stack-pr-tools {
+  display: grid;
+  gap: 0.6rem;
+}
+
+.stack-pr-tool {
+  display: grid;
+  grid-template-columns: 4.75rem auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+}
+
+.stack-pr-tool-name,
+.stack-pr-label,
+.stack-pr-output-label {
+  color: var(--color-muted-foreground);
+  font-size: 0.75rem;
+  font-weight: 650;
+}
+
+.stack-pr-tool-path,
+.stack-pr-path,
+.stack-pr-result-grid code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
+.stack-pr-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: fit-content;
+  border-radius: 999px;
+  border: 1px solid var(--color-border);
+  padding: 0.08rem 0.45rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.stack-pr-badge--ok {
+  border-color: color-mix(in srgb, #3fb97d 45%, var(--color-border));
+  background: color-mix(in srgb, #3fb97d 14%, transparent);
+}
+
+.stack-pr-badge--warn {
+  border-color: color-mix(in srgb, var(--color-destructive, #d14a4a) 45%, var(--color-border));
+  background: color-mix(in srgb, var(--color-destructive, #d14a4a) 12%, transparent);
+}
+
+.stack-pr-repo-status {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.stack-pr-separator {
+  margin: 0.8rem 0;
+  border-color: var(--color-border);
+}
+
+.stack-pr-error-text {
+  color: var(--color-destructive, #d14a4a);
+  overflow-wrap: anywhere;
+}
+
+.stack-pr-result-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.8rem;
+}
+
+.stack-pr-result-grid > div {
+  display: grid;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.stack-pr-parsed {
+  margin: 0.75rem 0;
+  padding: 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--color-border) 75%, transparent);
+  background: color-mix(in srgb, var(--color-muted) 20%, transparent);
+  border-radius: var(--radius-sm, 0.25rem);
+  overflow-wrap: anywhere;
+}
+
+.stack-pr-output-block {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.75rem;
+}
+
+.stack-pr-output-block pre {
+  margin: 0;
+  max-height: 20rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-background) 72%, var(--color-card));
+  border-radius: var(--radius-sm, 0.25rem);
+  padding: 0.75rem;
+  color: var(--color-foreground);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.8rem;
+}
+
+@media (max-width: 900px) {
+  .stack-pr-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 560px) {
+  .stack-pr-header,
+  .stack-pr-action-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .stack-pr-tool {
+    grid-template-columns: minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .stack-pr-result-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
