@@ -10285,6 +10285,39 @@ def cmd_profile(args):
 
     action = getattr(args, "profile_action", None)
 
+    if action == "health":
+        from hermes_cli.profile_health import CapabilityRequirements, check_profile_health
+
+        requirements = CapabilityRequirements(
+            required_toolsets=tuple(getattr(args, "required_toolset", None) or ()),
+            required_skills=tuple(getattr(args, "required_skill", None) or ()),
+            strict=not bool(getattr(args, "optional_capabilities", False)),
+        )
+        result = check_profile_health(
+            getattr(args, "profile_name"),
+            requirements=requirements,
+            workspace_path=getattr(args, "workspace_path", None),
+            project_home=getattr(args, "project_home", None),
+            ttl_seconds=getattr(args, "ttl_seconds", None),
+            use_cache=not bool(getattr(args, "no_cache", False)),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
+        else:
+            print(f"Profile: {result.profile}")
+            print(f"Status:  {result.status}")
+            print(f"Model:   {result.model or '—'}" + (f" ({result.provider})" if result.provider else ""))
+            print(f"Message: {result.message}")
+            if result.fingerprint:
+                print(f"Fingerprint: {result.fingerprint}")
+            if result.missing_requirements:
+                print("Missing requirements:")
+                for item in result.missing_requirements:
+                    print(f"  - {item}")
+        if result.status == "unhealthy":
+            sys.exit(1)
+        return
+
     if action is None:
         # Bare `hermes profile` — show current profile status
         profile_name = get_active_profile_name()
@@ -14127,6 +14160,38 @@ Examples:
 
     profile_show = profile_subparsers.add_parser("show", help="Show profile details")
     profile_show.add_argument("profile_name", help="Profile to show")
+
+    profile_health = profile_subparsers.add_parser(
+        "health", help="Run deterministic profile/worker health preflight checks"
+    )
+    profile_health.add_argument("profile_name", help="Profile to check")
+    profile_health.add_argument("--json", action="store_true", help="Emit JSON")
+    profile_health.add_argument(
+        "--required-toolset",
+        action="append",
+        default=[],
+        help="Required toolset name (repeatable)",
+    )
+    profile_health.add_argument(
+        "--required-skill",
+        action="append",
+        default=[],
+        help="Required skill name/path (repeatable)",
+    )
+    profile_health.add_argument(
+        "--optional-capabilities",
+        action="store_true",
+        help="Report missing required toolsets/skills as degraded instead of unhealthy",
+    )
+    profile_health.add_argument("--workspace-path", help="Workspace path to access-check")
+    profile_health.add_argument("--project-home", help="Project home path to access-check")
+    profile_health.add_argument(
+        "--ttl-seconds",
+        type=int,
+        default=300,
+        help="Health cache TTL in seconds (default: 300)",
+    )
+    profile_health.add_argument("--no-cache", action="store_true", help="Bypass health cache")
 
     profile_alias = profile_subparsers.add_parser(
         "alias", help="Manage wrapper scripts"
