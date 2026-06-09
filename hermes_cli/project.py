@@ -10,7 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
+from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping
@@ -102,6 +105,13 @@ class ProjectVerificationResult:
     failure_state: ProjectFailureState | None = None
     task_contract: TaskContract | None = None
     next_legal_action: str | None = None
+    truth_source: str | None = None
+    truth_read_at: str | None = None
+    board_snapshot: dict[str, Any] = field(default_factory=dict)
+    project_graph_snapshot: dict[str, Any] = field(default_factory=dict)
+    project_home_invariant: str | None = None
+    active_task: dict[str, Any] | None = None
+    board_event_watermark: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -116,6 +126,13 @@ class ProjectVerificationResult:
             "failure_state": self.failure_state.to_dict() if self.failure_state else None,
             "task_contract": self.task_contract.to_dict() if self.task_contract else None,
             "next_legal_action": self.next_legal_action,
+            "truth_source": self.truth_source,
+            "truth_read_at": self.truth_read_at,
+            "board_snapshot": dict(self.board_snapshot),
+            "project_graph_snapshot": dict(self.project_graph_snapshot),
+            "project_home_invariant": self.project_home_invariant,
+            "active_task": dict(self.active_task) if self.active_task else None,
+            "board_event_watermark": dict(self.board_event_watermark),
         }
 
 
@@ -622,23 +639,375 @@ def discover_project_for_task(task_id: str, board_slug: str | None = None) -> Pr
     )
 
 
+def _format_truth_time(now: datetime | int | float | None) -> str:
+    if now is None:
+        dt = datetime.now(timezone.utc)
+    elif isinstance(now, datetime):
+        dt = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    else:
+        dt = datetime.fromtimestamp(float(now), tz=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _bucket_task(row: Mapping[str, Any]) -> str:
+    status = str(row.get("status") or "").lower()
+    if status in {"done", "completed", "complete"} or row.get("completed_at"):
+        return "done"
+    if status == "blocked":
+        return "blocked"
+    if status in {"running", "in_progress", "claimed"}:
+        return "active"
+    if status in {"ready", "triage"}:
+        return "ready"
+    if status == "todo":
+        return "todo"
+    if row.get("current_run_id") or (row.get("started_at") and not row.get("completed_at")):
+        return "active"
+    return status or "unknown"
+
+
+def _counts_from_rows(rows: list[Mapping[str, Any]]) -> dict[str, int]:
+    counts: Counter[str] = Counter(_bucket_task(row) for row in rows)
+    return {
+        "total": len(rows),
+        "done": counts.get("done", 0),
+        "active": counts.get("active", 0),
+        "ready": counts.get("ready", 0),
+        "todo": counts.get("todo", 0),
+        "blocked": counts.get("blocked", 0),
+        "other": sum(v for k, v in counts.items() if k not in {"done", "active", "ready", "todo", "blocked"}),
+    }
+
+
+def _row_dict(row: Any) -> dict[str, Any]:
+    return dict(row) if row is not None else {}
+
+
+def _open_board_read_only(board_slug: str | None) -> tuple[sqlite3.Connection, Path]:
+    from hermes_cli import kanban_db as kb
+
+    path = kb.kanban_db_path(board=board_slug)
+    if not path.exists():
+        raise FileNotFoundError(f"cannot read board truth: board DB does not exist: {path}")
+    uri = f"file:{path.resolve()}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn, path
+
+
+def read_board_event_watermark(conn: sqlite3.Connection) -> dict[str, int]:
+    row = conn.execute("SELECT COALESCE(MAX(id), 0) AS max_id, COUNT(*) AS count FROM task_events").fetchone()
+    return {"max_event_id": int(row["max_id"] or 0), "event_count": int(row["count"] or 0)}
+
+
+def compute_full_board_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    rows = conn.execute(
+        "SELECT status, started_at, completed_at, current_run_id FROM tasks"
+    ).fetchall()
+    return _counts_from_rows([_row_dict(row) for row in rows])
+
+
+def compute_project_graph(root_task_id: str, conn: sqlite3.Connection) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        WITH RECURSIVE graph(id) AS (
+          SELECT ?
+          UNION
+          SELECT l.child_id
+          FROM task_links l
+          JOIN graph ON l.parent_id = graph.id
+          UNION
+          SELECT l.parent_id
+          FROM task_links l
+          JOIN graph ON l.child_id = graph.id
+        )
+        SELECT DISTINCT id FROM graph ORDER BY id ASC
+        """,
+        (root_task_id,),
+    ).fetchall()
+    ids = [str(row["id"]) for row in rows]
+    if not ids:
+        return {"root_task_id": root_task_id, "task_ids": [], "counts": _counts_from_rows([]), "tasks": []}
+    placeholders = ",".join("?" for _ in ids)
+    task_rows = conn.execute(
+        f"""
+        SELECT id, title, assignee, status, started_at, completed_at, current_run_id,
+               last_failure_error, result, created_at
+        FROM tasks
+        WHERE id IN ({placeholders})
+        ORDER BY created_at ASC, id ASC
+        """,
+        ids,
+    ).fetchall()
+    tasks = [_row_dict(row) for row in task_rows]
+    present_ids = {str(task["id"]) for task in tasks}
+    missing_ids = [task_id for task_id in ids if task_id not in present_ids]
+    return {
+        "root_task_id": root_task_id,
+        "task_ids": ids,
+        "missing_task_ids": missing_ids,
+        "counts": _counts_from_rows(tasks),
+        "tasks": tasks,
+    }
+
+
+def compute_active_task_details(conn: sqlite3.Connection, task_ids: list[str] | None = None) -> dict[str, Any] | None:
+    where = "WHERE status IN ('running', 'in_progress') OR current_run_id IS NOT NULL"
+    params: list[Any] = []
+    if task_ids:
+        placeholders = ",".join("?" for _ in task_ids)
+        where = f"WHERE id IN ({placeholders}) AND (status IN ('running', 'in_progress') OR current_run_id IS NOT NULL)"
+        params = list(task_ids)
+    row = conn.execute(
+        f"""
+        SELECT id, title, status, assignee, current_run_id
+        FROM tasks
+        {where}
+        ORDER BY started_at DESC, created_at ASC
+        LIMIT 1
+        """,
+        params,
+    ).fetchone()
+    if row is None:
+        return None
+    data = _row_dict(row)
+    return {
+        "id": data.get("id"),
+        "title": data.get("title"),
+        "status": data.get("status"),
+        "assignee": data.get("assignee"),
+        "run_id": data.get("current_run_id"),
+    }
+
+
+def read_board_snapshot(board_slug: str | None) -> dict[str, Any]:
+    conn, path = _open_board_read_only(board_slug)
+    try:
+        return {
+            "board_slug": board_slug or "default",
+            "db_path": str(path),
+            "counts": compute_full_board_counts(conn),
+            "event_watermark": read_board_event_watermark(conn),
+        }
+    finally:
+        conn.close()
+
+
+def _project_home_invariant(project_home: Path, project_json: Mapping[str, Any]) -> tuple[str, list[str]]:
+    errors: list[str] = []
+    if not project_home.exists():
+        errors.append(f"project home does not exist: {project_home}")
+    if not (project_home / PROJECT_JSON).exists():
+        errors.append(f"missing {PROJECT_JSON}: {project_home / PROJECT_JSON}")
+    declared = project_json.get("project_home")
+    if declared:
+        try:
+            if Path(str(declared)).expanduser().resolve() != project_home.resolve():
+                errors.append("project_home in project.json does not match loaded project home")
+        except OSError:
+            errors.append("project_home path could not be resolved")
+    return ("BROKEN" if errors else "OK"), errors
+
+
+def compute_next_legal_transition(result: ProjectVerificationResult) -> str:
+    if result.failure_state:
+        message = result.failure_state.message
+        if "cannot read board truth" in message:
+            return "repair board DB access, then rerun `hermes project verify --json`"
+        if result.project_home_invariant == "BROKEN":
+            return "repair project-home invariant before dispatch"
+        return result.next_legal_action or f"resolve {result.failure_state.failure_class}: {message}"
+    graph_counts = result.project_graph_snapshot.get("counts", {}) if result.project_graph_snapshot else {}
+    active = result.active_task
+    if active:
+        return f"monitor or unblock active task {active.get('id')} ({active.get('title')})"
+    if graph_counts.get("blocked", 0):
+        return "resolve the first blocked project task before dispatching more work"
+    if graph_counts.get("ready", 0):
+        return "dispatch the next ready project task"
+    if graph_counts.get("todo", 0):
+        return "wait for dependencies or promote the next eligible todo task"
+    if graph_counts.get("active", 0):
+        return "monitor active project task until it completes or blocks"
+    if graph_counts.get("total", 0) and graph_counts.get("done", 0) == graph_counts.get("total", 0):
+        return "verify completion contracts, then transition project to DONE"
+    return "repair project graph membership before dispatch"
+
+
+def verify_project(
+    project_home_or_slug: str | os.PathLike[str],
+    *,
+    board: str | None = None,
+    now: datetime | int | float | None = None,
+) -> ProjectVerificationResult:
+    truth_read_at = _format_truth_time(now)
+    loaded = load_project(project_home_or_slug, board_slug=board, strict=True)
+    board_slug = board or loaded.board_slug
+    if not loaded.ok:
+        return ProjectVerificationResult(
+            **{
+                **loaded.to_dict(),
+                "lifecycle_state": loaded.lifecycle_state,
+                "failure_state": loaded.failure_state,
+                "task_contract": loaded.task_contract,
+                "truth_read_at": truth_read_at,
+                "next_legal_action": loaded.next_legal_action or compute_next_legal_transition(loaded),
+            }
+        )
+
+    try:
+        conn, board_path = _open_board_read_only(board_slug)
+    except Exception as exc:
+        failure = ProjectFailureState(
+            "board_read_failure",
+            f"cannot read board truth: {exc}",
+            owner="process",
+            fingerprint="board_read_failure",
+        )
+        result = ProjectVerificationResult(
+            ok=False,
+            lifecycle_state=ProjectState.UNKNOWN,
+            autopilot_confidence="stopped",
+            project_home=loaded.project_home,
+            project_slug=loaded.project_slug,
+            board_slug=board_slug,
+            project_json=loaded.project_json,
+            errors=[failure.message],
+            warnings=loaded.warnings,
+            failure_state=failure,
+            truth_read_at=truth_read_at,
+            project_home_invariant="UNKNOWN",
+        )
+        return ProjectVerificationResult(
+            **{**result.to_dict(), "lifecycle_state": result.lifecycle_state, "failure_state": failure, "next_legal_action": compute_next_legal_transition(result)}
+        )
+
+    try:
+        board_counts = compute_full_board_counts(conn)
+        watermark = read_board_event_watermark(conn)
+        root_task_id = str((loaded.project_json or {}).get("root_task_id") or "")
+        graph = compute_project_graph(root_task_id, conn)
+        active_task = compute_active_task_details(conn, graph.get("task_ids") or None)
+        schema_result = validate_project_schema(loaded.project_json or {}, strict=True, project_home=loaded.project_home, board_conn=conn)
+    finally:
+        conn.close()
+
+    home = Path(str(loaded.project_home)).expanduser() if loaded.project_home else _candidate_project_home(project_home_or_slug)
+    invariant, invariant_errors = _project_home_invariant(home, loaded.project_json or {})
+    errors = list(schema_result.errors) + invariant_errors
+    failure: ProjectFailureState | None = schema_result.failure_state
+    state = schema_result.lifecycle_state if schema_result.ok else ProjectState.BROKEN_INVARIANT
+    confidence = "operational" if schema_result.ok and invariant == "OK" else "stopped"
+    ok = schema_result.ok and invariant == "OK"
+
+    root_present = any(task.get("id") == root_task_id for task in graph.get("tasks", []))
+    if not root_present:
+        errors.append(f"root task {root_task_id} not found on board {board_slug}")
+        failure = ProjectFailureState("project_graph", errors[-1], fingerprint="project_root_missing")
+        state = ProjectState.BROKEN_INVARIANT
+        confidence = "stopped"
+        ok = False
+
+    graph_counts = graph.get("counts", {})
+    if ok:
+        if graph_counts.get("active", 0):
+            state = ProjectState.EXECUTING
+        elif graph_counts.get("blocked", 0):
+            state = ProjectState.BLOCKED_PROCESS
+            confidence = "degraded"
+        elif graph_counts.get("ready", 0) or graph_counts.get("todo", 0):
+            state = ProjectState.READY
+        elif graph_counts.get("total", 0) and graph_counts.get("done", 0) == graph_counts.get("total", 0):
+            state = ProjectState.DONE
+
+    if loaded.lifecycle_state is ProjectState.DONE and graph_counts.get("total", 0) != graph_counts.get("done", 0):
+        msg = "project.json says DONE but board graph still has active/non-done tasks"
+        errors.append(msg)
+        failure = ProjectFailureState("project_board_disagreement", msg, fingerprint="project_done_disagreement")
+        state = ProjectState.BROKEN_INVARIANT
+        confidence = "stopped"
+        ok = False
+
+    result = ProjectVerificationResult(
+        ok=ok,
+        lifecycle_state=state,
+        autopilot_confidence=confidence,
+        project_home=loaded.project_home,
+        project_slug=loaded.project_slug,
+        board_slug=board_slug,
+        project_json=loaded.project_json,
+        errors=errors,
+        warnings=loaded.warnings,
+        failure_state=failure,
+        task_contract=loaded.task_contract,
+        truth_source=str(board_path),
+        truth_read_at=truth_read_at,
+        board_snapshot={"counts": board_counts, "db_path": str(board_path), "board_slug": board_slug},
+        project_graph_snapshot={k: v for k, v in graph.items() if k != "tasks"},
+        project_home_invariant=invariant,
+        active_task=active_task,
+        board_event_watermark=watermark,
+    )
+    return ProjectVerificationResult(
+        **{**result.to_dict(), "lifecycle_state": result.lifecycle_state, "failure_state": failure, "task_contract": result.task_contract, "next_legal_action": compute_next_legal_transition(result)}
+    )
+
+
+def _fmt_counts(counts: Mapping[str, Any]) -> str:
+    return ", ".join(f"{key}={int(counts.get(key, 0) or 0)}" for key in ("total", "done", "active", "ready", "todo", "blocked", "other"))
+
+
+def render_project_status(result: ProjectVerificationResult) -> str:
+    board_counts = (result.board_snapshot or {}).get("counts", {})
+    graph_counts = (result.project_graph_snapshot or {}).get("counts", {})
+    active = result.active_task
+    if active:
+        active_line = f"{active.get('id')} / {active.get('title')} / {active.get('status')} / {active.get('assignee')} / run_id={active.get('run_id')}"
+    else:
+        active_line = "none"
+    blocker = "none" if not result.failure_state else json.dumps(result.failure_state.to_dict(), sort_keys=True)
+    return "\n".join(
+        [
+            "# Project status",
+            "",
+            f"State: {result.lifecycle_state.value}",
+            f"Truth source: {result.truth_source or 'unknown'}",
+            f"Truth read at: {result.truth_read_at or 'unknown'}",
+            f"Board snapshot: {_fmt_counts(board_counts)}",
+            f"Project graph snapshot: {_fmt_counts(graph_counts)}",
+            f"Project-home invariant: {result.project_home_invariant or 'UNKNOWN'}",
+            f"Active task: {active_line}",
+            f"Next legal transition: {result.next_legal_action or compute_next_legal_transition(result)}",
+            f"Blocker: {blocker}",
+            f"Autopilot confidence: {result.autopilot_confidence}",
+            "",
+        ]
+    )
+
+
 def cmd_project(args: argparse.Namespace) -> int:
     action = getattr(args, "project_action", None)
     if action == "verify":
-        result = load_project(
+        result = verify_project(
             args.project,
-            board_slug=getattr(args, "board", None),
-            strict=getattr(args, "strict", False),
+            board=getattr(args, "board", None),
         )
         if getattr(args, "json", False):
             print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
         else:
-            status = "OK" if result.ok else result.lifecycle_state.value
-            print(f"{status}: {result.project_home or args.project}")
-            for err in result.errors:
-                print(f"error: {err}")
-            for warning in result.warnings:
-                print(f"warning: {warning}")
+            print(render_project_status(result))
+        return 0 if result.ok else 1
+    if action == "status":
+        result = verify_project(
+            args.project,
+            board=getattr(args, "board", None),
+        )
+        status_text = render_project_status(result)
+        if getattr(args, "write", False):
+            home = Path(result.project_home or _candidate_project_home(args.project))
+            home.mkdir(parents=True, exist_ok=True)
+            (home / "STATUS.md").write_text(status_text, encoding="utf-8")
+        print(status_text)
         return 0 if result.ok else 1
     raise SystemExit("missing project subcommand")
 
@@ -646,14 +1015,18 @@ def cmd_project(args: argparse.Namespace) -> int:
 def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
     parser = parent_subparsers.add_parser(
         "project",
-        help="Inspect Hermes Project Autopilot project schemas",
-        description="Read-only Project Autopilot schema and contract commands.",
+        help="Inspect Hermes Project Autopilot project truth",
+        description="Read-only Project Autopilot schema, verifier, and status commands.",
     )
     sub = parser.add_subparsers(dest="project_action")
-    verify = sub.add_parser("verify", help="Validate a project.json schema")
+    verify = sub.add_parser("verify", help="Verify project truth from project.json and kanban board")
     verify.add_argument("project", help="Project slug under active projects/ or project home path")
     verify.add_argument("--board", help="Expected kanban board slug")
-    verify.add_argument("--strict", action="store_true", help="Require strict project-autopilot/v1 schema")
+    verify.add_argument("--strict", action="store_true", help="Accepted for compatibility; verifier always requires strict project-autopilot/v1 schema")
     verify.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    status = sub.add_parser("status", help="Render truthful project STATUS.md text")
+    status.add_argument("project", help="Project slug under active projects/ or project home path")
+    status.add_argument("--board", help="Expected kanban board slug")
+    status.add_argument("--write", action="store_true", help="Write STATUS.md in the project home")
     parser.set_defaults(func=cmd_project)
     return parser
