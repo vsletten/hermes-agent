@@ -1182,7 +1182,7 @@ def test_cli_heartbeat_verb(kanban_home):
 def test_recompute_ready_emits_promoted_not_ready(kanban_home):
     conn = kb.connect()
     try:
-        parent = kb.create_task(conn, title="p")
+        parent = kb.create_task(conn, title="p", assignee="w")
         child = kb.create_task(conn, title="c", parents=[parent])
         kb.complete_task(conn, parent, result="ok")
         # recompute_ready runs inside complete_task too, but call it again
@@ -1191,10 +1191,68 @@ def test_recompute_ready_emits_promoted_not_ready(kanban_home):
         events = kb.list_events(conn, child)
         kinds = [e.kind for e in events]
         assert "promoted" in kinds
-        # Old name must not appear.
         assert "ready" not in kinds
     finally:
         conn.close()
+
+
+def test_project_gave_up_block_is_not_auto_promoted_without_repair(kanban_home, tmp_path, monkeypatch):
+    projects = tmp_path / "projects" / "active"
+    projects.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_PROJECTS_HOME", str(projects))
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="parent", assignee="w")
+        child = kb.create_task(conn, title="child", assignee="w", parents=[parent])
+        project_home = projects / "proj"
+        project_home.mkdir(parents=True, exist_ok=True)
+        status = tmp_path / "status" / f"{child}.md"
+        project = {
+            "schema_version": "project-autopilot/v1",
+            "slug": "proj",
+            "board_slug": "default",
+            "root_task_id": parent,
+            "project_home": str(project_home),
+            "lifecycle_state": "READY",
+            "execution_policy": {"requires_task_contracts": True},
+            "worker_policy": {"allowed_profiles": ["w"]},
+            "task_contracts": {
+                parent: {
+                    "expected_outputs": [str(tmp_path / "status" / f"{parent}.md")],
+                    "workspace_kind": "scratch",
+                    "completion_contract": {"status_report": str(tmp_path / "status" / f"{parent}.md"), "tests": ["pytest"]},
+                },
+                child: {
+                    "expected_outputs": [str(status)],
+                    "workspace_kind": "scratch",
+                    "completion_contract": {"status_report": str(status), "tests": ["pytest"]},
+                },
+            },
+            "failure_state": {},
+        }
+        (project_home / "project.json").write_text(json.dumps(project), encoding="utf-8")
+
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', consecutive_failures = 1, last_failure_error = ? WHERE id = ?",
+                ("OpenAI HTTP 401 token_expired", child),
+            )
+            kb._append_event(
+                conn, child, "project_failure_classified",
+                {
+                    "failure_class": "worker_health",
+                    "normalized_fingerprint": "worker_auth_expired",
+                    "retry_budget_key": f"{child}:w:worker_health:worker_auth_expired",
+                },
+            )
+            kb._append_event(conn, child, "gave_up", {"trigger_outcome": "spawn_failed"})
+
+        kb.complete_task(conn, parent, result="ok")
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, child).status == "blocked"
+    finally:
+        conn.close()
+
 
 
 def test_spawn_failure_circuit_breaker_emits_gave_up(kanban_home, all_assignees_spawnable):

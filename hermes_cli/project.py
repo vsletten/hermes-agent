@@ -94,6 +94,34 @@ class TaskContract:
 
 
 @dataclass(frozen=True)
+class CompletionDecision:
+    """Project task completion-contract decision."""
+
+    project_owned: bool
+    allowed: bool
+    reason: str | None = None
+    missing: list[str] = field(default_factory=list)
+    failure_class: str | None = None
+    failure_fingerprint: str | None = None
+    owner: str | None = None
+    legal_next_action: str | None = None
+    project_slug: str | None = None
+    project_home: str | None = None
+
+    def event_payload(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason,
+            "missing": list(self.missing),
+            "failure_class": self.failure_class,
+            "failure_fingerprint": self.failure_fingerprint,
+            "owner": self.owner,
+            "legal_next_action": self.legal_next_action,
+            "project_slug": self.project_slug,
+            "project_home": self.project_home,
+        }
+
+
+@dataclass(frozen=True)
 class ProjectPreflightDecision:
     """Dispatcher decision for a project-owned task before claim/spawn."""
 
@@ -1016,6 +1044,164 @@ def render_project_status(result: ProjectVerificationResult) -> str:
             f"Autopilot confidence: {result.autopilot_confidence}",
             "",
         ]
+    )
+
+
+def _completion_contract_paths(contract: TaskContract) -> tuple[list[str], str | None]:
+    completion = contract.completion_contract or {}
+    artifacts_raw = completion.get("artifacts") or completion.get("artifact_paths") or []
+    if isinstance(artifacts_raw, str):
+        artifacts = [artifacts_raw]
+    elif isinstance(artifacts_raw, list):
+        artifacts = [str(p) for p in artifacts_raw if str(p).strip()]
+    else:
+        artifacts = []
+    if not artifacts:
+        status_path = completion.get("status_report")
+        artifacts = [p for p in contract.expected_outputs if p != status_path]
+    status_report = completion.get("status_report")
+    return artifacts, str(status_report) if status_report else None
+
+
+def _nonempty_file(path_text: str) -> bool:
+    try:
+        path = Path(path_text).expanduser()
+        return path.is_file() and bool(path.read_text(encoding="utf-8").strip())
+    except OSError:
+        return False
+    except UnicodeDecodeError:
+        try:
+            return Path(path_text).expanduser().is_file() and Path(path_text).expanduser().stat().st_size > 0
+        except OSError:
+            return False
+
+
+def validate_completion_contract(
+    task_id: str,
+    run_id: int | None,
+    metadata: Mapping[str, Any] | None,
+    project_json: Mapping[str, Any],
+    board_snapshot: Mapping[str, Any] | None = None,
+) -> CompletionDecision:
+    """Validate strict Project Autopilot task completion artifacts/status.
+
+    The validator is read-only: it checks declared artifacts/status report paths
+    and completion metadata, but does not mutate the board or project home.
+    """
+
+    contract = parse_task_contract(task_id, project_json)
+    contract_result = validate_task_contract(contract)
+    project_slug = str(project_json.get("slug") or "") or None
+    project_home = str(project_json.get("project_home") or "") or None
+    if not contract_result.ok:
+        return CompletionDecision(
+            project_owned=True,
+            allowed=False,
+            reason="invalid task contract: " + "; ".join(contract_result.errors),
+            missing=list(contract_result.errors),
+            failure_class="completion_contract",
+            failure_fingerprint="completion_contract_invalid",
+            owner="process",
+            legal_next_action="repair task completion contract before completing task",
+            project_slug=project_slug,
+            project_home=project_home,
+        )
+
+    completion = contract.completion_contract or {}
+    artifacts, status_report = _completion_contract_paths(contract)
+    metadata_artifacts = set()
+    if isinstance(metadata, Mapping):
+        raw = metadata.get("artifacts")
+        if isinstance(raw, list):
+            metadata_artifacts = {str(p) for p in raw if str(p).strip()}
+
+    missing: list[str] = []
+    reasons: list[str] = []
+    for artifact in artifacts:
+        if not _nonempty_file(artifact):
+            missing.append(artifact)
+            reasons.append(f"missing artifact: {artifact}")
+        if metadata_artifacts and artifact not in metadata_artifacts:
+            reasons.append(f"artifact not listed in metadata: {artifact}")
+    if not status_report:
+        reasons.append("missing status report contract")
+    elif not _nonempty_file(status_report):
+        missing.append(status_report)
+        reasons.append(f"missing status report: {status_report}")
+
+    status_text = ""
+    if status_report and Path(status_report).expanduser().is_file():
+        try:
+            status_text = Path(status_report).expanduser().read_text(encoding="utf-8")
+        except OSError:
+            status_text = ""
+    if status_text:
+        if completion.get("require_task_id_in_status", True) and task_id not in status_text:
+            reasons.append(f"status report does not mention task id {task_id}")
+        if completion.get("require_artifacts_listed_in_status", True):
+            for artifact in artifacts:
+                if artifact not in status_text:
+                    reasons.append(f"status report does not list artifact: {artifact}")
+        lowered = status_text.lower()
+        if completion.get("require_blockers_field", True) and "blockers:" not in lowered and "blocker:" not in lowered:
+            reasons.append("status report missing blockers field")
+        if completion.get("require_next_safe_action", True) and "next safe action:" not in lowered:
+            reasons.append("status report missing next safe action field")
+
+    if reasons:
+        return CompletionDecision(
+            project_owned=True,
+            allowed=False,
+            reason="; ".join(reasons),
+            missing=missing,
+            failure_class="completion_contract",
+            failure_fingerprint="completion_contract_invalid",
+            owner="process",
+            legal_next_action="write required artifact/status report, then retry completion",
+            project_slug=project_slug,
+            project_home=project_home,
+        )
+
+    return CompletionDecision(
+        project_owned=True,
+        allowed=True,
+        project_slug=project_slug,
+        project_home=project_home,
+    )
+
+
+def completion_decision_for_task(
+    task_id: str,
+    *,
+    board_slug: str | None = None,
+    run_id: int | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> CompletionDecision:
+    discovered = discover_project_for_task(task_id, board_slug=board_slug)
+    if not discovered.ok and discovered.failure_state and discovered.failure_state.failure_class == "project_membership_missing":
+        return CompletionDecision(project_owned=False, allowed=True)
+    if not discovered.ok:
+        return CompletionDecision(
+            project_owned=True,
+            allowed=False,
+            reason="project discovery failed: " + "; ".join(discovered.errors),
+            missing=list(discovered.errors),
+            failure_class=discovered.failure_state.failure_class if discovered.failure_state else "project_completion",
+            failure_fingerprint=discovered.failure_state.fingerprint if discovered.failure_state else "project_completion_discovery_failed",
+            owner=discovered.failure_state.owner if discovered.failure_state else "process",
+            legal_next_action=discovered.next_legal_action or "repair project membership before completion",
+            project_slug=discovered.project_slug,
+            project_home=discovered.project_home,
+        )
+    execution_policy = discovered.project_json.get("execution_policy") if isinstance(discovered.project_json, Mapping) else {}
+    if isinstance(execution_policy, Mapping) and not bool(execution_policy.get("strict_completion_contracts", execution_policy.get("requires_task_contracts", True))):
+        return CompletionDecision(project_owned=True, allowed=True, project_slug=discovered.project_slug, project_home=discovered.project_home)
+    return validate_completion_contract(
+        task_id,
+        run_id=run_id,
+        metadata=metadata,
+        project_json=discovered.project_json or {},
+        board_snapshot={},
     )
 
 

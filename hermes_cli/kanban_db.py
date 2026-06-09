@@ -2421,7 +2421,8 @@ def _synthesize_ended_run(
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return True when ``task_id`` is sticky-blocked by an explicit
-    worker/operator ``kanban_block`` call (#28712).
+    worker/operator ``kanban_block`` call (#28712) or a Project Autopilot
+    failure classification that requires repair before retry.
 
     A ``blocked`` status can come from two very different sources:
 
@@ -2454,7 +2455,15 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
         "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    if row and row["kind"] == "blocked":
+        return True
+    project_failure = conn.execute(
+        "SELECT 1 FROM task_events "
+        "WHERE task_id = ? AND kind = 'project_failure_classified' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return bool(project_failure)
 
 
 def recompute_ready(conn: sqlite3.Connection) -> int:
@@ -3146,6 +3155,45 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    try:
+        from hermes_cli.project import completion_decision_for_task
+
+        run_id = expected_run_id if expected_run_id is not None else _current_run_id(conn, task_id)
+        completion_decision = completion_decision_for_task(
+            task_id,
+            board_slug=get_current_board(),
+            run_id=run_id,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        completion_decision = None
+        completion_exception = exc
+    else:
+        completion_exception = None
+    if completion_exception is not None:
+        reason = f"project-completion-contract: validator exception: {completion_exception}"
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "project_completion_rejected",
+                {
+                    "reason": str(completion_exception),
+                    "failure_class": "project_completion_exception",
+                    "failure_fingerprint": "project_completion_exception",
+                    "owner": "process",
+                    "legal_next_action": "repair project completion validator before completing task",
+                },
+            )
+        block_task(conn, task_id, reason=reason)
+        return False
+    if completion_decision and completion_decision.project_owned and not completion_decision.allowed:
+        reason = f"project-completion-contract: {completion_decision.reason or 'completion contract rejected'}"
+        with write_txn(conn):
+            _append_event(conn, task_id, "project_completion_rejected", completion_decision.event_payload())
+        block_task(conn, task_id, reason=reason)
+        return False
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -5247,6 +5295,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+def _project_failure_classification(conn: sqlite3.Connection, task_id: str, error: str, outcome: str):
+    try:
+        from hermes_cli.failure_classifier import FailureClassifierInput, classify_worker_or_task_failure
+        from hermes_cli.project import discover_project_for_task
+
+        discovered = discover_project_for_task(task_id, board_slug=get_current_board())
+        if not discovered.ok:
+            if discovered.failure_state and discovered.failure_state.failure_class == "project_membership_missing":
+                return None
+            # Project claims are broken; still classify as project-owned process failure.
+        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        profile = row["assignee"] if row is not None else None
+        return classify_worker_or_task_failure(
+            FailureClassifierInput(
+                task_id=task_id,
+                profile=profile,
+                outcome=outcome,
+                error_text=error,
+            )
+        )
+    except Exception:
+        return None
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5294,6 +5366,15 @@ def _record_task_failure(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    classification = _project_failure_classification(conn, task_id, error, outcome)
+    if classification and classification.normalized_fingerprint in {
+        "worker_auth_expired",
+        "worker_auth_missing_api_key",
+        "worker_model_auth_failed",
+        "worker_protocol_violation_before_work",
+        "completion_artifact_missing",
+    }:
+        failure_limit = 1 if failure_limit is None else min(int(failure_limit), 1)
     blocked = False
     with write_txn(conn):
         row = conn.execute(
@@ -5316,6 +5397,19 @@ def _record_task_failure(
         else:
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
+
+        if classification:
+            _append_event(
+                conn,
+                task_id,
+                "project_failure_classified",
+                {
+                    **classification.to_dict(),
+                    "trigger_outcome": outcome,
+                    "error": error[:500],
+                    "failures": failures,
+                },
+            )
 
         if failures >= effective_limit:
             # Trip the breaker.
@@ -5350,6 +5444,7 @@ def _record_task_failure(
                         "trigger_outcome": outcome,
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
+                        **({"project_failure": classification.to_dict()} if classification else {}),
                     },
                 )
             payload = {
@@ -5361,6 +5456,8 @@ def _record_task_failure(
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
+            if classification:
+                payload["project_failure"] = classification.to_dict()
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
@@ -5390,7 +5487,7 @@ def _record_task_failure(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={"failures": failures},
+                    metadata={"failures": failures, **({"project_failure": classification.to_dict()} if classification else {})},
                 )
                 _append_event(
                     conn, task_id, outcome,
