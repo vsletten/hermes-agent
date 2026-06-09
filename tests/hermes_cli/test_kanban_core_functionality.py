@@ -4531,3 +4531,59 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
         )
         assert res.stale == [], "stale_timeout_seconds=0 should disable detection"
         assert kb.get_task(conn, t).status == "running"
+
+
+def test_project_gate_still_blocks_child_promoted_by_parent_completion(kanban_home, tmp_path, monkeypatch, all_assignees_spawnable):
+    from hermes_cli.project import SUPPORTED_SCHEMA_VERSION
+
+    projects = tmp_path / "projects" / "active"
+    projects.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_PROJECTS_HOME", str(projects))
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="parent", assignee="worker")
+        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
+        assert kb.get_task(conn, child).status == "todo"
+        claimed = kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, expected_run_id=claimed.current_run_id)
+        assert kb.get_task(conn, child).status == "ready"
+
+        project_home = projects / "proj"
+        project_home.mkdir()
+        status_path = tmp_path / "status" / f"{child}.md"
+        project = {
+            "schema_version": SUPPORTED_SCHEMA_VERSION,
+            "slug": "proj",
+            "board_slug": "default",
+            "root_task_id": parent,
+            "project_home": str(project_home),
+            "lifecycle_state": "BLOCKED_WORKER",
+            "execution_policy": {"requires_task_contracts": True},
+            "worker_policy": {"allowed_profiles": ["worker"]},
+            "task_contracts": {
+                parent: {
+                    "expected_outputs": [str(tmp_path / "status" / f"{parent}.md")],
+                    "workspace_kind": "scratch",
+                    "completion_contract": {"status_report": str(tmp_path / "status" / f"{parent}.md"), "tests": ["pytest"]},
+                },
+                child: {
+                    "expected_outputs": [str(status_path)],
+                    "workspace_kind": "scratch",
+                    "completion_contract": {"status_report": str(status_path), "tests": ["pytest"]},
+                },
+            },
+            "failure_state": {},
+        }
+        (project_home / "project.json").write_text(json.dumps(project, indent=2), encoding="utf-8")
+
+        result = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: 1234)
+        task = kb.get_task(conn, child)
+        events = conn.execute(
+            "SELECT kind FROM task_events WHERE task_id = ? ORDER BY id", (child,)
+        ).fetchall()
+    finally:
+        conn.close()
+    assert result.spawned == []
+    assert child in result.auto_blocked
+    assert task.status == "blocked"
+    assert "project_preflight_blocked" in [row["kind"] for row in events]

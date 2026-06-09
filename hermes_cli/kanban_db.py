@@ -3610,7 +3610,7 @@ def block_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                 """,
                 (task_id,),
             )
@@ -3623,7 +3623,7 @@ def block_task(
                        claim_expires= NULL,
                        worker_pid   = NULL
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'review')
                    AND current_run_id = ?
                 """,
                 (task_id, int(expected_run_id)),
@@ -5588,6 +5588,68 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+
+
+def _project_preflight_gate(
+    conn: sqlite3.Connection,
+    task: Optional[Task],
+    task_id: str,
+    assignee: str,
+    *,
+    board: Optional[str] = None,
+    dry_run: bool = False,
+) -> tuple[bool, str | None]:
+    """Return (allowed, reason) for the Project Autopilot dispatch gate.
+
+    Non-project tasks are allowed.  Deterministic project holds are blocked
+    before claim/spawn and audited with a project_preflight_blocked event.
+    """
+    if task is None:
+        return True, None
+    try:
+        from hermes_cli.project import project_preflight_for_task
+
+        decision = project_preflight_for_task(
+            task_id,
+            board_slug=board,
+            assignee=assignee,
+            task_row=task,
+            workspace_kind=task.workspace_kind,
+            workspace_path=task.workspace_path,
+            branch_name=task.branch_name,
+        )
+    except Exception as exc:
+        reason = f"project-preflight: preflight exception: {exc}"
+        if dry_run:
+            return False, reason
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "project_preflight_blocked",
+                {
+                    "failure_class": "project_preflight_exception",
+                    "failure_fingerprint": "project_preflight_exception",
+                    "owner": "process",
+                    "legal_next_action": "repair project preflight implementation before dispatch",
+                    "project_slug": None,
+                    "project_home": None,
+                    "reason": str(exc),
+                },
+            )
+        if block_task(conn, task_id, reason=reason):
+            return False, reason
+        return False, reason
+
+    if not decision.project_owned or decision.allowed:
+        return True, None
+    reason = f"project-preflight: {decision.reason or 'project dispatch blocked'}"
+    if dry_run:
+        return False, reason
+    with write_txn(conn):
+        _append_event(conn, task_id, "project_preflight_blocked", decision.event_payload())
+    block_task(conn, task_id, reason=reason)
+    return False, reason
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -5839,6 +5901,14 @@ def dispatch_once(
                     if block_task(conn, row["id"], reason=reason):
                         result.auto_blocked.append(row["id"])
                 continue
+        allowed, project_reason = _project_preflight_gate(
+            conn, preflight_task, row["id"], row_assignee, board=board, dry_run=dry_run
+        )
+        if not allowed:
+            result.respawn_guarded.append((row["id"], project_reason or "project-preflight"))
+            if not dry_run:
+                result.auto_blocked.append(row["id"])
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, str(preflight_workspace or "")))
             # Increment per-profile counter even in dry_run so the cap
@@ -5946,6 +6016,14 @@ def dispatch_once(
                     if block_task(conn, row["id"], reason=reason):
                         result.auto_blocked.append(row["id"])
                 continue
+        allowed, project_reason = _project_preflight_gate(
+            conn, preflight_task, row["id"], row["assignee"], board=board, dry_run=dry_run
+        )
+        if not allowed:
+            result.respawn_guarded.append((row["id"], project_reason or "project-preflight"))
+            if not dry_run:
+                result.auto_blocked.append(row["id"])
+            continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], str(preflight_workspace or "")))
             continue

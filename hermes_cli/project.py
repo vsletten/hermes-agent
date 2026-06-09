@@ -91,6 +91,40 @@ class TaskContract:
         }
 
 
+
+
+@dataclass(frozen=True)
+class ProjectPreflightDecision:
+    """Dispatcher decision for a project-owned task before claim/spawn."""
+
+    project_owned: bool
+    allowed: bool
+    reason: str | None = None
+    failure_class: str | None = None
+    failure_fingerprint: str | None = None
+    owner: str | None = None
+    legal_next_action: str | None = None
+    project_slug: str | None = None
+    project_home: str | None = None
+    lifecycle_state: str | None = None
+
+    @property
+    def blocked(self) -> bool:
+        return self.project_owned and not self.allowed
+
+    def event_payload(self) -> dict[str, Any]:
+        return {
+            "failure_class": self.failure_class,
+            "failure_fingerprint": self.failure_fingerprint,
+            "owner": self.owner,
+            "legal_next_action": self.legal_next_action,
+            "project_slug": self.project_slug,
+            "project_home": self.project_home,
+            "lifecycle_state": self.lifecycle_state,
+            "reason": self.reason,
+        }
+
+
 @dataclass(frozen=True)
 class ProjectVerificationResult:
     ok: bool
@@ -1030,3 +1064,201 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     status.add_argument("--write", action="store_true", help="Write STATUS.md in the project home")
     parser.set_defaults(func=cmd_project)
     return parser
+
+
+HOLD_STATES_DENY_DISPATCH = {
+    ProjectState.BROKEN_INVARIANT,
+    ProjectState.BLOCKED_WORKER,
+    ProjectState.BLOCKED_PROCESS,
+    ProjectState.PAUSED,
+    ProjectState.RECOVERY_REQUIRED,
+    ProjectState.BLOCKED_HUMAN,
+}
+
+
+def _project_home_hint_from_task_row(task_row: Any | None) -> str | None:
+    if task_row is None:
+        return None
+    row = task_row if isinstance(task_row, Mapping) else getattr(task_row, "__dict__", {})
+    body = str(row.get("body") or "") if isinstance(row, Mapping) else ""
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        lower = line.lower()
+        for prefix in ("project_home:", "project home:", "project-home:"):
+            if lower.startswith(prefix):
+                return line.split(":", 1)[1].strip().strip("`'\"") or None
+    return None
+
+
+def _requirements_from_contract(contract: TaskContract | None):
+    from hermes_cli.profile_health import CapabilityRequirements
+
+    raw = contract.raw if contract else {}
+    req = raw.get("capability_requirements") if isinstance(raw, Mapping) else None
+    if isinstance(req, Mapping):
+        return CapabilityRequirements.from_dict(req)
+    return CapabilityRequirements(
+        required_toolsets=tuple(raw.get("required_toolsets") or ()) if isinstance(raw, Mapping) else (),
+        required_skills=tuple(raw.get("required_skills") or ()) if isinstance(raw, Mapping) else (),
+        strict=bool(raw.get("strict_capabilities", True)) if isinstance(raw, Mapping) else True,
+    )
+
+
+def _failure_decision(
+    result: ProjectVerificationResult,
+    *,
+    reason: str | None = None,
+    failure_class: str | None = None,
+    fingerprint: str | None = None,
+    owner: str | None = None,
+    legal_next_action: str | None = None,
+) -> ProjectPreflightDecision:
+    failure = result.failure_state
+    message = reason or (failure.message if failure else (result.errors[0] if result.errors else "project preflight denied"))
+    return ProjectPreflightDecision(
+        project_owned=True,
+        allowed=False,
+        reason=message,
+        failure_class=failure_class or (failure.failure_class if failure else "project_preflight"),
+        failure_fingerprint=fingerprint or (failure.fingerprint if failure else None) or "project_preflight_blocked",
+        owner=owner or (failure.owner if failure else "process"),
+        legal_next_action=legal_next_action or result.next_legal_action or "repair project before dispatch",
+        project_slug=result.project_slug,
+        project_home=result.project_home,
+        lifecycle_state=result.lifecycle_state.value,
+    )
+
+
+def project_preflight_for_task(
+    task_id: str,
+    *,
+    board_slug: str | None = None,
+    assignee: str | None = None,
+    task_row: Any | None = None,
+    workspace_kind: str | None = None,
+    workspace_path: str | None = None,
+    branch_name: str | None = None,
+    now: float | None = None,
+) -> ProjectPreflightDecision:
+    """Fail-closed dispatcher gate for strict Project Autopilot tasks.
+
+    Non-project tasks return ``project_owned=False, allowed=True`` so legacy
+    Kanban dispatch behavior is unchanged.  Project-owned tasks are denied
+    before claim/spawn when project state, task contract, or required worker
+    health is deterministicly unhealthy.
+    """
+    hinted_home = _project_home_hint_from_task_row(task_row)
+    if hinted_home:
+        discovered = load_project(hinted_home, board_slug=board_slug, strict=False)
+        if not discovered.ok:
+            return _failure_decision(discovered)
+        if task_id != discovered.project_json.get("root_task_id") and task_id not in (discovered.project_json.get("task_contracts") or {}):
+            return _failure_decision(
+                discovered,
+                reason=f"project home does not claim task {task_id}",
+                failure_class="project_membership_missing",
+                fingerprint="project_membership_missing",
+                legal_next_action="add task to the project task_contracts or remove project_home hint",
+            )
+        contract = parse_task_contract(task_id, discovered.project_json or {})
+        contract_result = validate_task_contract(contract, task_row=task_row)
+        if not contract_result.ok:
+            discovered = ProjectVerificationResult(
+                ok=False, lifecycle_state=contract_result.lifecycle_state, autopilot_confidence="stopped",
+                project_home=discovered.project_home, project_slug=discovered.project_slug, board_slug=discovered.board_slug,
+                project_json=discovered.project_json, errors=contract_result.errors, failure_state=contract_result.failure_state,
+                task_contract=contract, next_legal_action=contract_result.next_legal_action,
+            )
+        else:
+            discovered = ProjectVerificationResult(
+                ok=True, lifecycle_state=discovered.lifecycle_state, autopilot_confidence=discovered.autopilot_confidence,
+                project_home=discovered.project_home, project_slug=discovered.project_slug, board_slug=discovered.board_slug,
+                project_json=discovered.project_json, warnings=discovered.warnings, task_contract=contract,
+            )
+    else:
+        discovered = discover_project_for_task(task_id, board_slug=board_slug)
+        if (not discovered.ok and discovered.failure_state and discovered.failure_state.failure_class == "project_membership_missing"):
+            return ProjectPreflightDecision(project_owned=False, allowed=True)
+
+    if not discovered.ok:
+        if any(str(err).startswith(f"task_contracts.{task_id}:") for err in discovered.errors):
+            contract = parse_task_contract(task_id, discovered.project_json or {})
+            contract_result = validate_task_contract(contract, task_row=task_row)
+            return _failure_decision(
+                ProjectVerificationResult(
+                    ok=False, lifecycle_state=contract_result.lifecycle_state, autopilot_confidence="stopped",
+                    project_home=discovered.project_home, project_slug=discovered.project_slug, board_slug=discovered.board_slug,
+                    project_json=discovered.project_json, errors=contract_result.errors or discovered.errors,
+                    failure_state=contract_result.failure_state, task_contract=contract,
+                    next_legal_action=contract_result.next_legal_action,
+                )
+            )
+        return _failure_decision(discovered)
+
+    contract = discovered.task_contract
+    if contract is None:
+        return _failure_decision(
+            discovered, reason="missing task contract after project discovery",
+            failure_class="task_contract", fingerprint="task_contract_missing",
+            legal_next_action="repair task contract before dispatch",
+        )
+    contract_with_row = validate_task_contract(contract, task_row=task_row)
+    if not contract_with_row.ok:
+        return _failure_decision(
+            ProjectVerificationResult(
+                ok=False, lifecycle_state=contract_with_row.lifecycle_state, autopilot_confidence="stopped",
+                project_home=discovered.project_home, project_slug=discovered.project_slug, board_slug=discovered.board_slug,
+                project_json=discovered.project_json, errors=contract_with_row.errors, failure_state=contract_with_row.failure_state,
+                task_contract=contract, next_legal_action=contract_with_row.next_legal_action,
+            )
+        )
+
+    if discovered.lifecycle_state in HOLD_STATES_DENY_DISPATCH:
+        if discovered.lifecycle_state == ProjectState.BLOCKED_PROCESS and contract.kind == "repair":
+            pass
+        else:
+            failure = discovered.failure_state or ProjectFailureState(
+                "project_state_hold",
+                f"project lifecycle_state {discovered.lifecycle_state.value} blocks dispatch",
+                owner="process",
+                fingerprint=f"project_state_{discovered.lifecycle_state.value.lower()}",
+            )
+            return _failure_decision(
+                ProjectVerificationResult(
+                    ok=False, lifecycle_state=discovered.lifecycle_state, autopilot_confidence="stopped",
+                    project_home=discovered.project_home, project_slug=discovered.project_slug, board_slug=discovered.board_slug,
+                    project_json=discovered.project_json, failure_state=failure, task_contract=contract,
+                    errors=[failure.message], next_legal_action=discovered.next_legal_action or "repair project hold before dispatch",
+                )
+            )
+
+    worker_policy = discovered.project_json.get("worker_policy") if isinstance(discovered.project_json, Mapping) else {}
+    if not isinstance(worker_policy, Mapping):
+        worker_policy = {}
+    if assignee and bool(worker_policy.get("dispatch_requires_worker_health", False)):
+        from hermes_cli.profile_health import DEGRADED, HEALTHY, check_profile_health
+
+        health = check_profile_health(
+            assignee,
+            requirements=_requirements_from_contract(contract),
+            workspace_path=workspace_path or contract.workspace_path,
+            project_home=discovered.project_home,
+            now=now,
+        )
+        allow_degraded = bool(worker_policy.get("allow_degraded_worker_health", False))
+        health_allowed = health.status == HEALTHY or (allow_degraded and health.status == DEGRADED)
+        if not health_allowed:
+            return ProjectPreflightDecision(
+                project_owned=True, allowed=False, reason=health.message,
+                failure_class=health.failure_class or "worker_health",
+                failure_fingerprint=health.fingerprint or "worker_health_unknown",
+                owner="worker",
+                legal_next_action="repair worker profile health or reroute by policy before dispatch",
+                project_slug=discovered.project_slug, project_home=discovered.project_home,
+                lifecycle_state=ProjectState.BLOCKED_WORKER.value,
+            )
+
+    return ProjectPreflightDecision(
+        project_owned=True, allowed=True, project_slug=discovered.project_slug,
+        project_home=discovered.project_home, lifecycle_state=discovered.lifecycle_state.value,
+    )
