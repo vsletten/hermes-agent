@@ -525,6 +525,33 @@ class TestTranscribeLocalExtended:
         assert result["success"] is True
         assert result["transcript"] == "Hello world"
 
+    def test_default_local_runtime_uses_cpu_int8(self, tmp_path):
+        """In-process local STT defaults to CPU/int8 so gateway avoids CUDA residency."""
+        audio = tmp_path / "test.ogg"
+        audio.write_bytes(b"fake")
+
+        seg = MagicMock()
+        seg.text = "safe"
+        info = MagicMock()
+        info.language = "en"
+        info.duration = 1.0
+
+        mock_model = MagicMock()
+        mock_model.transcribe.return_value = ([seg], info)
+        mock_whisper_cls = MagicMock(return_value=mock_model)
+
+        with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
+             patch("faster_whisper.WhisperModel", mock_whisper_cls), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"local": {}}), \
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._local_model_key", None):
+            from tools.transcription_tools import _transcribe_local
+            result = _transcribe_local(str(audio), "base")
+
+        assert result["success"] is True
+        mock_whisper_cls.assert_called_once_with("base", device="cpu", compute_type="int8")
+
     def test_load_time_cuda_lib_failure_falls_back_to_cpu(self, tmp_path):
         """Missing libcublas at load time → reload on CPU, succeed."""
         audio = tmp_path / "test.ogg"
@@ -549,8 +576,10 @@ class TestTranscribeLocalExtended:
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch("faster_whisper.WhisperModel", side_effect=fake_whisper), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"local": {"device": "auto"}}), \
              patch("tools.transcription_tools._local_model", None), \
-             patch("tools.transcription_tools._local_model_name", None):
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._local_model_key", None):
             from tools.transcription_tools import _transcribe_local
             result = _transcribe_local(str(audio), "base")
 
@@ -587,8 +616,10 @@ class TestTranscribeLocalExtended:
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch("faster_whisper.WhisperModel", side_effect=fake_whisper), \
+             patch("tools.transcription_tools._load_stt_config", return_value={"local": {"device": "auto"}}), \
              patch("tools.transcription_tools._local_model", None), \
-             patch("tools.transcription_tools._local_model_name", None):
+             patch("tools.transcription_tools._local_model_name", None), \
+             patch("tools.transcription_tools._local_model_key", None):
             from tools.transcription_tools import _transcribe_local
             result = _transcribe_local(str(audio), "base")
 

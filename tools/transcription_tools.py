@@ -85,6 +85,7 @@ _HAS_MISTRAL = _safe_find_spec("mistralai")
 
 DEFAULT_PROVIDER = "local"
 DEFAULT_LOCAL_MODEL = "base"
+DEFAULT_LOCAL_DEVICE = "cpu"
 DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
@@ -92,6 +93,8 @@ DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest"
 DEFAULT_ELEVENLABS_STT_MODEL = os.getenv("STT_ELEVENLABS_MODEL", "scribe_v2")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
+LOCAL_STT_DEVICE_ENV = "HERMES_LOCAL_STT_DEVICE"
+LOCAL_STT_COMPUTE_TYPE_ENV = "HERMES_LOCAL_STT_COMPUTE_TYPE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
@@ -110,6 +113,7 @@ GROQ_MODELS = {"whisper-large-v3", "whisper-large-v3-turbo", "distil-whisper-lar
 # Singleton for the local model — loaded once, reused across calls
 _local_model: Optional[object] = None
 _local_model_name: Optional[str] = None
+_local_model_key: Optional[tuple[str, str, str]] = None
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -202,6 +206,49 @@ def _normalize_local_model(model_name: Optional[str]) -> str:
 
 def _normalize_local_command_model(model_name: Optional[str]) -> str:
     return _normalize_local_model(model_name)
+
+
+def _normalize_local_device(device_name: Optional[str]) -> str:
+    """Return a supported faster-whisper device for in-process local STT.
+
+    The gateway is a long-lived message router. Defaulting local STT to CPU
+    avoids pulling CTranslate2/CUDA libraries and a GPU context into that
+    process after the first voice message. Users who explicitly want GPU STT
+    can set ``stt.local.device: cuda`` (or ``auto`` for the historical picker).
+    """
+    value = (device_name or DEFAULT_LOCAL_DEVICE).strip().lower()
+    if value in {"cpu", "cuda", "auto"}:
+        return value
+    logger.warning(
+        "Unsupported stt.local.device '%s'; falling back to '%s'. "
+        "Supported values: cpu, cuda, auto.",
+        device_name,
+        DEFAULT_LOCAL_DEVICE,
+    )
+    return DEFAULT_LOCAL_DEVICE
+
+
+def _normalize_local_compute_type(compute_type: Optional[str], device: str) -> str:
+    """Return faster-whisper compute_type, with a gateway-safe CPU default."""
+    value = (compute_type or "").strip().lower()
+    if value:
+        return value
+    return "int8" if device == "cpu" else "auto"
+
+
+def _get_local_whisper_runtime_config() -> tuple[str, str]:
+    """Return ``(device, compute_type)`` for faster-whisper local STT."""
+    local_cfg = _load_stt_config().get("local", {})
+    if not isinstance(local_cfg, dict):
+        local_cfg = {}
+    device = _normalize_local_device(
+        local_cfg.get("device") or os.getenv(LOCAL_STT_DEVICE_ENV)
+    )
+    compute_type = _normalize_local_compute_type(
+        local_cfg.get("compute_type") or os.getenv(LOCAL_STT_COMPUTE_TYPE_ENV),
+        device,
+    )
+    return device, compute_type
 
 
 def _try_lazy_install_stt() -> bool:
@@ -1080,28 +1127,25 @@ def _looks_like_cuda_lib_error(exc: BaseException) -> bool:
     return any(marker in msg for marker in _CUDA_LIB_ERROR_MARKERS)
 
 
-def _load_local_whisper_model(model_name: str):
-    """Load faster-whisper with graceful CUDA → CPU fallback.
+def _load_local_whisper_model(model_name: str, device: str, compute_type: str):
+    """Load faster-whisper with config-driven runtime selection.
 
-    faster-whisper's ``device="auto"`` picks CUDA when the ctranslate2 wheel
-    ships CUDA shared libs, even on hosts where the NVIDIA runtime
-    (``libcublas.so.12`` / ``libcudnn*``) isn't installed — common on WSL2
-    without CUDA-on-WSL, headless servers, and CPU-only developer machines.
-    On those hosts the load itself sometimes succeeds and the dlopen failure
-    only surfaces at first ``transcribe()`` call.
-
-    We try ``auto`` first (fast CUDA path when it works), and on any CUDA
-    library load failure fall back to CPU + int8.
+    The historical ``device=\"auto\"`` default eagerly picks CUDA on GPU hosts.
+    In a long-lived gateway process that pins CTranslate2/CUDA libraries, a CUDA
+    context, and large file-cache charges after the first voice message.  Hermes
+    now defaults in-process local STT to CPU/int8 and lets users opt into GPU via
+    ``stt.local.device: cuda`` or the old picker via ``stt.local.device: auto``.
     """
     from faster_whisper import WhisperModel
     try:
-        return WhisperModel(model_name, device="auto", compute_type="auto")
+        return WhisperModel(model_name, device=device, compute_type=compute_type)
     except Exception as exc:
-        if not _looks_like_cuda_lib_error(exc):
+        if device == "cpu" or not _looks_like_cuda_lib_error(exc):
             raise
         logger.warning(
             "faster-whisper CUDA load failed (%s) — falling back to CPU (int8). "
-            "Install the NVIDIA CUDA runtime (libcublas/libcudnn) to use GPU.",
+            "Set stt.local.device: cpu to avoid CUDA probing, or install the "
+            "NVIDIA CUDA runtime (libcublas/libcudnn) to use GPU.",
             exc,
         )
         return WhisperModel(model_name, device="cpu", compute_type="int8")
@@ -1109,18 +1153,27 @@ def _load_local_whisper_model(model_name: str):
 
 def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
     """Transcribe using faster-whisper (local, free)."""
-    global _local_model, _local_model_name
+    global _local_model, _local_model_name, _local_model_key
 
     if not _HAS_FASTER_WHISPER:
         if not _try_lazy_install_stt():
             return {"success": False, "transcript": "", "error": "faster-whisper not installed"}
 
     try:
+        device, compute_type = _get_local_whisper_runtime_config()
+        model_key = (model_name, device, compute_type)
+
         # Lazy-load the model (downloads on first use, ~150 MB for 'base')
-        if _local_model is None or _local_model_name != model_name:
-            logger.info("Loading faster-whisper model '%s' (first load downloads the model)...", model_name)
-            _local_model = _load_local_whisper_model(model_name)
+        if _local_model is None or _local_model_key != model_key:
+            logger.info(
+                "Loading faster-whisper model '%s' (device=%s, compute_type=%s; first load downloads the model)...",
+                model_name,
+                device,
+                compute_type,
+            )
+            _local_model = _load_local_whisper_model(model_name, device, compute_type)
             _local_model_name = model_name
+            _local_model_key = model_key
 
         # Language: config.yaml (stt.local.language) > env var > auto-detect.
         _forced_lang = (
@@ -1128,7 +1181,7 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             or os.getenv(LOCAL_STT_LANGUAGE_ENV)
             or None
         )
-        transcribe_kwargs = {"beam_size": 5}
+        transcribe_kwargs: Dict[str, Any] = {"beam_size": 5}
         if _forced_lang:
             transcribe_kwargs["language"] = _forced_lang
 
@@ -1141,7 +1194,7 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             # model, reload on CPU, retry once.  Without this the module-
             # global `_local_model` is poisoned and every subsequent voice
             # message on this process fails identically until restart.
-            if not _looks_like_cuda_lib_error(exc):
+            if device == "cpu" or not _looks_like_cuda_lib_error(exc):
                 raise
             logger.warning(
                 "faster-whisper CUDA runtime failed mid-transcribe (%s) — "
@@ -1150,9 +1203,11 @@ def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
             )
             _local_model = None
             _local_model_name = None
+            _local_model_key = None
             from faster_whisper import WhisperModel
             _local_model = WhisperModel(model_name, device="cpu", compute_type="int8")
             _local_model_name = model_name
+            _local_model_key = (model_name, "cpu", "int8")
             segments, info = _local_model.transcribe(file_path, **transcribe_kwargs)
             transcript = " ".join(segment.text.strip() for segment in segments)
 

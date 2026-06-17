@@ -823,6 +823,8 @@ stt:
   # provider: "local"          # auto-detected if omitted
   local:
     model: "base"              # tiny | base | small | medium | large-v3 | turbo
+    device: "cpu"              # cpu (gateway-safe default) | cuda | auto
+    compute_type: "int8"       # int8 for CPU; use float16/auto with cuda if desired
     # language: ""             # auto-detect; set to "en", "es", "fr", etc. to force
   openai:
     model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe
