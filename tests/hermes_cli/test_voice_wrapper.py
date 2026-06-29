@@ -280,6 +280,7 @@ class TestContinuousLoopSimulation:
         monkeypatch.setattr(voice, "_continuous_on_transcript", None)
         monkeypatch.setattr(voice, "_continuous_on_status", None)
         monkeypatch.setattr(voice, "_continuous_on_silent_limit", None)
+        monkeypatch.setattr(voice, "_continuous_on_no_speech", None)
         monkeypatch.setattr(voice, "_continuous_auto_restart", True, raising=False)
         monkeypatch.setattr(voice, "_voice_busy_probe", None, raising=False)
         monkeypatch.setattr(voice, "_play_beep", lambda *_, **__: None)
@@ -360,6 +361,38 @@ class TestContinuousLoopSimulation:
 
 
 
+    def test_force_transcribe_empty_single_shot_notifies_no_speech(
+        self, fake_recorder, monkeypatch
+    ):
+        import hermes_cli.voice as voice
+
+        class ImmediateThread:
+            def __init__(self, target, daemon=False):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        monkeypatch.setattr(voice.threading, "Thread", ImmediateThread)
+        monkeypatch.setattr(
+            voice,
+            "transcribe_recording",
+            lambda _p: {"success": True, "transcript": ""},
+        )
+        monkeypatch.setattr(voice, "is_whisper_hallucination", lambda _t: False)
+
+        no_speech = []
+        transcripts = []
+        voice.start_continuous(
+            on_transcript=lambda t: transcripts.append(t),
+            on_no_speech=lambda: no_speech.append(True),
+            auto_restart=False,
+        )
+        voice.stop_continuous(force_transcribe=True)
+
+        assert transcripts == []
+        assert no_speech == [True]
+
 
     def test_silent_limit_halts_loop_after_three_strikes(self, fake_recorder, monkeypatch):
         import hermes_cli.voice as voice
@@ -374,10 +407,12 @@ class TestContinuousLoopSimulation:
         monkeypatch.setattr(voice, "is_whisper_hallucination", lambda _t: False)
 
         transcripts = []
+        no_speech = []
         silent_limit_fired = []
 
         voice.start_continuous(
             on_transcript=lambda t: transcripts.append(t),
+            on_no_speech=lambda: no_speech.append(True),
             on_silent_limit=lambda: silent_limit_fired.append(True),
         )
 
@@ -386,6 +421,7 @@ class TestContinuousLoopSimulation:
             fake_recorder.last_callback()
 
         assert transcripts == []
+        assert no_speech == [True, True, True]
         assert silent_limit_fired == [True]
         assert voice.is_continuous_active() is False
         assert fake_recorder.cancelled >= 1
