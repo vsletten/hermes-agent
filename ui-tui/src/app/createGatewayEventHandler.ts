@@ -612,6 +612,14 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
+        if (ev.payload?.no_speech) {
+          setVoiceRecording(false)
+          setVoiceProcessing(false)
+          sys('voice: no speech detected')
+
+          return
+        }
+
         const text = String(ev.payload?.text ?? '').trim()
 
         if (!text) {
