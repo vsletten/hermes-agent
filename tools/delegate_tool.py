@@ -2772,12 +2772,58 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
 
     if configured_base_url:
-        # When delegation.api_key is not set, return None so _build_child_agent
-        # falls back to the parent agent's API key via the credential inheritance
-        # path (effective_api_key = override_api_key or parent_api_key). This
-        # lets providers that store their key in a non-OPENAI_API_KEY env var
-        # (e.g. MINIMAX_API_KEY, DASHSCOPE_API_KEY) work without requiring
-        # callers to duplicate the key under delegation.api_key.
+        # Direct endpoint overrides still need provider-specific credential
+        # resolution when delegation.provider is set.  Otherwise an empty
+        # delegation.api_key falls through to the parent's key in
+        # _build_child_agent, which is wrong for configs such as:
+        #   provider=ollama-cloud, base_url=https://ollama.com/v1
+        # with OLLAMA_API_KEY living in ~/.hermes/.env.  That path used to send
+        # the parent's OpenAI/Codex key to Ollama Cloud and produced child-only
+        # HTTP 401s even though the provider key was configured correctly.
+        if configured_provider:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                runtime = resolve_runtime_provider(
+                    requested=configured_provider,
+                    explicit_api_key=configured_api_key,
+                    explicit_base_url=configured_base_url,
+                    target_model=configured_model,
+                )
+            except Exception as exc:
+                raise ValueError(
+                    f"Cannot resolve delegation provider '{configured_provider}' "
+                    f"for base_url '{configured_base_url}': {exc}. Check that "
+                    f"the provider API key is set in ~/.hermes/.env or run "
+                    f"'hermes auth'."
+                ) from exc
+
+            api_key = runtime.get("api_key", "")
+            if not api_key:
+                raise ValueError(
+                    f"Delegation provider '{configured_provider}' resolved for "
+                    f"base_url '{configured_base_url}' but has no API key. Set "
+                    f"the appropriate environment variable or run 'hermes auth'."
+                )
+
+            api_mode = runtime.get("api_mode") or "chat_completions"
+            if configured_api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
+                api_mode = configured_api_mode
+
+            return {
+                "model": configured_model or runtime.get("model") or None,
+                "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
+                "base_url": configured_base_url,
+                "api_key": api_key,
+                "api_mode": api_mode,
+                "command": runtime.get("command"),
+                "args": list(runtime.get("args") or []),
+            }
+
+        # No provider was configured: preserve the historical direct-endpoint
+        # behavior where an omitted delegation.api_key means the child inherits
+        # the parent's key.  This supports custom OpenAI-compatible endpoints
+        # that intentionally share the parent credential.
         api_key = configured_api_key  # None → inherited from parent in _build_child_agent
 
         # Use the shared URL-based api_mode detector (same path the main agent's
