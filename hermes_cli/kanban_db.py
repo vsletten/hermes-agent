@@ -5520,15 +5520,11 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       resolves against the dispatcher's CWD instead of a meaningful
       root.  Users who want a kanban-root-relative workspace should
       compute the absolute path themselves.
-    - ``worktree``: a real linked git worktree. If ``workspace_path`` names
-      a repo root, Hermes treats it as an anchor and materializes a linked
-      worktree at ``<repo>/.worktrees/<task-id>``. If ``workspace_path`` names
-      a concrete target path, Hermes creates/reuses that linked worktree. With
-      no ``workspace_path``, Hermes anchors on the board's ``default_workdir``
-      and materializes ``<repo>/.worktrees/<task-id>`` per task; if no
-      ``default_workdir`` is configured it raises rather than guessing from the
-      dispatcher's CWD. When ``branch_name`` is empty, Hermes uses
-      ``wt/<task-id>``.
+    - ``worktree``: a pre-existing git worktree at ``workspace_path``.
+      ``workspace_path`` and ``branch_name`` are required.  The dispatcher
+      validates that the path exists, is a git worktree, and is already on
+      the declared branch before spawning a worker.  Workers must never be
+      the first process to discover a missing declared worktree.
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
@@ -5564,7 +5560,60 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         p.mkdir(parents=True, exist_ok=True)
         return p
     if kind == "worktree":
-        p, _branch_name = _resolve_worktree_workspace(task, board=board)
+        if not task.workspace_path:
+            raise ValueError(
+                f"task {task.id} has workspace_kind=worktree but no workspace_path; "
+                "create the git worktree before dispatch and store its absolute path"
+            )
+        p = Path(task.workspace_path).expanduser()
+        if not p.is_absolute():
+            raise ValueError(
+                f"task {task.id} has non-absolute worktree path "
+                f"{task.workspace_path!r}; use an absolute path"
+            )
+        if not task.branch_name:
+            raise ValueError(
+                f"task {task.id} has workspace_kind=worktree but no branch_name; "
+                "worktree tasks must declare the expected branch before dispatch"
+            )
+        if not p.exists():
+            raise ValueError(
+                f"task {task.id} declares worktree path {str(p)!r}, but it does not exist; "
+                f"create it with `git worktree add -b {task.branch_name} {p} <base-ref>` "
+                "before dispatch"
+            )
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(p), "rev-parse", "--is-inside-work-tree"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception as exc:
+            raise ValueError(
+                f"task {task.id} declares worktree path {str(p)!r}, but git validation failed: {exc}"
+            ) from exc
+        if proc.returncode != 0 or (proc.stdout or "").strip() != "true":
+            detail = (proc.stderr or proc.stdout or "not a git worktree").strip()
+            raise ValueError(
+                f"task {task.id} declares worktree path {str(p)!r}, but it is not a git worktree: {detail}"
+            )
+        branch_proc = subprocess.run(
+            ["git", "-C", str(p), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        actual_branch = (branch_proc.stdout or "").strip()
+        if branch_proc.returncode != 0 or actual_branch != task.branch_name:
+            detail = (branch_proc.stderr or "").strip()
+            suffix = f": {detail}" if detail else ""
+            raise ValueError(
+                f"task {task.id} declares branch {task.branch_name!r} at {str(p)!r}, "
+                f"but actual branch is {actual_branch!r}{suffix}"
+            )
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
@@ -7419,8 +7468,21 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        preflight_workspace: Optional[Path] = None
+        preflight_task = get_task(conn, row["id"])
+        if preflight_task is not None and (preflight_task.workspace_kind or "scratch") == "worktree":
+            try:
+                preflight_workspace = resolve_workspace(preflight_task, board=board)
+            except Exception as exc:
+                reason = f"workspace-preflight: {exc}"
+                if dry_run:
+                    result.respawn_guarded.append((row["id"], reason))
+                else:
+                    if block_task(conn, row["id"], reason=reason):
+                        result.auto_blocked.append(row["id"])
+                continue
         if dry_run:
-            result.spawned.append((row["id"], row_assignee, ""))
+            result.spawned.append((row["id"], row_assignee, str(preflight_workspace or "")))
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -7519,8 +7581,21 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        preflight_workspace: Optional[Path] = None
+        preflight_task = get_task(conn, row["id"])
+        if preflight_task is not None and (preflight_task.workspace_kind or "scratch") == "worktree":
+            try:
+                preflight_workspace = resolve_workspace(preflight_task, board=board)
+            except Exception as exc:
+                reason = f"workspace-preflight: {exc}"
+                if dry_run:
+                    result.respawn_guarded.append((row["id"], reason))
+                else:
+                    if block_task(conn, row["id"], reason=reason):
+                        result.auto_blocked.append(row["id"])
+                continue
         if dry_run:
-            result.spawned.append((row["id"], row["assignee"], ""))
+            result.spawned.append((row["id"], row["assignee"], str(preflight_workspace or "")))
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
