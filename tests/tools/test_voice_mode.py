@@ -225,6 +225,17 @@ class TestDetectAudioEnvironment:
         assert any("WSL" in w for w in result["warnings"])
         assert any("PulseAudio" in w for w in result["warnings"])
 
+    def test_voice_capture_install_hint_prefers_uv_for_managed_venv(self, monkeypatch):
+        monkeypatch.setattr("tools.voice_mode._is_termux_environment", lambda: False)
+        monkeypatch.setattr("tools.voice_mode.shutil.which", lambda command: "/opt/homebrew/bin/uv" if command == "uv" else None)
+
+        from tools.voice_mode import _voice_capture_install_hint
+
+        hint = _voice_capture_install_hint()
+
+        assert hint.startswith("uv pip install --python ")
+        assert "sounddevice numpy" in hint
+
     def test_docker_with_pipewire_remote_and_no_devices_allows_voice(self, monkeypatch):
         """PIPEWIRE_REMOTE should bypass empty PortAudio device lists in Docker."""
         monkeypatch.delenv("SSH_CLIENT", raising=False)

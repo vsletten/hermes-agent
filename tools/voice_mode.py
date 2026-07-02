@@ -5,7 +5,7 @@ STT dispatch via tools.transcription_tools, and TTS playback via
 sounddevice or system audio players.
 
 Dependencies (optional):
-    pip install sounddevice numpy
+    uv pip install --python /path/to/hermes/venv/bin/python sounddevice numpy
     or: uv sync --extra voice
 """
 
@@ -124,6 +124,11 @@ from hermes_constants import is_termux as _is_termux_environment
 def _voice_capture_install_hint() -> str:
     if _is_termux_environment():
         return "pkg install python-numpy portaudio && python -m pip install sounddevice"
+    # The bundled Hermes venv ships without pip, so `uv pip install --python`
+    # against the running interpreter is the most reliable hint when uv is
+    # available.
+    if shutil.which("uv"):
+        return f"uv pip install --python {sys.executable} sounddevice numpy"
     # If we're running inside a venv (e.g. the bundled Hermes venv at
     # ~/.hermes/profiles/<name>/hermes-agent/venv/), `pip install` on the
     # user's PATH won't reach the right site-packages — the bare hint sends
@@ -137,7 +142,7 @@ def _voice_capture_install_hint() -> str:
                 return f"{pip_in_venv} install sounddevice numpy"
     except Exception:
         pass
-    return "pip install sounddevice numpy"
+    return f"{sys.executable} -m pip install sounddevice numpy"
 
 
 def _termux_microphone_command() -> Optional[str]:
@@ -1060,7 +1065,7 @@ class AudioRecorder:
         except ImportError as e:
             raise RuntimeError(
                 "Voice mode requires sounddevice and numpy.\n"
-                f"Install with: {sys.executable} -m pip install sounddevice numpy"
+                f"Install with: {_voice_capture_install_hint()}"
             ) from e
 
         with self._lock:
