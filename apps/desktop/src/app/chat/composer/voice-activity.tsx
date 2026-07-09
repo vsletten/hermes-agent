@@ -68,13 +68,23 @@ function VoiceLevelBars({ level, active }: { active: boolean; level: number }) {
   )
 }
 
-function getElementAnalyser(audioElement: HTMLAudioElement): ElementAnalyser | null {
+export function getElementAnalyser(audioElement: HTMLAudioElement): ElementAnalyser | null {
   let entry = elementAnalysers.get(audioElement)
 
   if (!entry) {
     const context = getPlaybackAudioContext()
 
-    if (!context) {
+    if (!context || context.state === 'closed') {
+      return null
+    }
+
+    if (context.state !== 'running') {
+      // Creating a MediaElementSource immediately reroutes the <audio> element
+      // through the Web Audio graph. If the context is still suspended, that
+      // reroute mutes playback while the media element itself continues and
+      // eventually fires `ended` with no error. Try to unlock the context for a
+      // future render, but do not attach until it is actually running.
+      void context.resume().catch(() => undefined)
       return null
     }
 
@@ -88,8 +98,6 @@ function getElementAnalyser(audioElement: HTMLAudioElement): ElementAnalyser | n
     entry = { analyser }
     elementAnalysers.set(audioElement, entry)
   }
-
-  void playbackAudioContext?.resume()
 
   return entry
 }
