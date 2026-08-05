@@ -85,6 +85,7 @@ export function getElementAnalyser(audioElement: HTMLAudioElement): ElementAnaly
       // eventually fires `ended` with no error. Try to unlock the context for a
       // future render, but do not attach until it is actually running.
       void context.resume().catch(() => undefined)
+
       return null
     }
 
