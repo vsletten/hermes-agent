@@ -511,6 +511,69 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_respawn_guard_ignores_pr_context_comment_before_first_run(kanban_home):
+    """Pre-run PR context must not strand a finalizer initially or after a crash."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="finalize related PR", assignee="a")
+        kb.add_comment(
+            conn,
+            tid,
+            "orchestrator",
+            "Reconcile https://github.com/example/repo/pull/123 after review.",
+        )
+
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        run_id = task.current_run_id
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='crashed', ended_at=? "
+            "WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_blocks_pr_comment_after_worker_run(kanban_home):
+    """The duplicate-PR guard still applies when a prior worker may have published."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="publish once", assignee="a")
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        run_id = task.current_run_id
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='crashed', ended_at=? "
+            "WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        kb.add_comment(
+            conn,
+            tid,
+            "a",
+            "Created https://github.com/example/repo/pull/123 before crashing.",
+        )
+
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
+
+
 
 
 
