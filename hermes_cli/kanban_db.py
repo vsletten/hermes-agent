@@ -8226,9 +8226,12 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         arrives AFTER that completion — that's a deliberate re-run request.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        After at least one worker run, a GitHub PR URL appears in a comment
+        authored by the task's assignee after that run started (and within
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior
+        worker already opened a PR; re-spawning risks a duplicate PR on the
+        same task.  Comments written before a task's first run are task
+        context, not evidence that this task already published a PR.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -8236,7 +8239,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -8310,14 +8313,32 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    # 4. GitHub PR URL in a recent comment after a prior worker run — that
+    #    worker may already have opened a PR.  Never apply this guard to a
+    #    never-started task: orchestrators legitimately put related PR URLs in
+    #    review/finalizer context comments before the first dispatch. Treating
+    #    those comments as publication evidence strands the task in ``ready``.
+    prior_run = conn.execute(
+        "SELECT started_at FROM task_runs WHERE task_id = ? "
+        "ORDER BY started_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if prior_run is not None:
+        pr_cutoff = max(
+            now - _RESPAWN_GUARD_PR_WINDOW,
+            int(prior_run["started_at"] or 0),
+        )
+        for c in conn.execute(
+            "SELECT body, author FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ?",
+            (task_id, pr_cutoff),
+        ).fetchall():
+            if (
+                c["author"] == row["assignee"]
+                and c["body"]
+                and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
+            ):
+                return "active_pr"
 
     return None
 
