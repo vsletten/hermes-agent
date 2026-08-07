@@ -9486,7 +9486,7 @@ def check_respawn_guard(
 
     ``"active_pr"``
         After at least one worker run, a GitHub PR URL appears in a comment
-        authored by the task's assignee after that run started (and within
+        authored by the profile that ran the task after that run started (and within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior
         worker already opened a PR; re-spawning risks a duplicate PR on the
         same task.  Comments written before a task's first run are task
@@ -9498,7 +9498,7 @@ def check_respawn_guard(
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
+        "SELECT last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -9584,7 +9584,7 @@ def check_respawn_guard(
     #    review/finalizer context comments before the first dispatch. Treating
     #    those comments as publication evidence strands the task in ``ready``.
     prior_run = conn.execute(
-        "SELECT started_at FROM task_runs WHERE task_id = ? "
+        "SELECT started_at, profile FROM task_runs WHERE task_id = ? "
         "ORDER BY started_at DESC LIMIT 1",
         (task_id,),
     ).fetchone()
@@ -9599,7 +9599,7 @@ def check_respawn_guard(
             (task_id, pr_cutoff),
         ).fetchall():
             if (
-                c["author"] == row["assignee"]
+                c["author"] == prior_run["profile"]
                 and c["body"]
                 and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
             ):
