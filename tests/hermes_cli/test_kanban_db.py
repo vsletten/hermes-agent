@@ -556,6 +556,10 @@ def test_respawn_guard_blocks_pr_comment_after_worker_run(kanban_home):
             (tid,),
         )
         conn.commit()
+        # Reassignment after the failed run must not hide publication evidence
+        # written by the profile that actually performed that run.
+        conn.execute("UPDATE tasks SET assignee='b' WHERE id=?", (tid,))
+        conn.commit()
         kb.add_comment(
             conn,
             tid,
