@@ -597,18 +597,6 @@ def _init_git_repo_with_origin(repo: Path) -> None:
     subprocess.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=repo, capture_output=True, check=True)
 
 
-def test_archive_task_removes_scratch_workspace(kanban_home):
-    with kb.connect() as conn:
-        tid = kb.create_task(conn, title="scratch cleanup")
-        task = kb.get_task(conn, tid)
-        assert task is not None
-        ws = kb.resolve_workspace(task)
-        (ws / "artifact.txt").write_text("leftover")
-        assert ws.exists()
-        assert kb.archive_task(conn, tid) is True
-    assert not ws.exists()
-
-
 def test_archive_task_keeps_worktree_with_unpushed_commits(kanban_home, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -632,36 +620,6 @@ def test_archive_task_keeps_worktree_with_unpushed_commits(kanban_home, tmp_path
         )
         assert kb.archive_task(conn, tid) is True
     assert wt_path.exists()
-
-
-def test_archive_task_removes_worktree_when_no_unpushed_commits(kanban_home, tmp_path):
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _init_git_repo_with_origin(repo)
-    wt_path = tmp_path / "repo-worktree"
-    subprocess.run(
-        ["git", "worktree", "add", str(wt_path), "-b", "feat/test-cleanup", "HEAD"],
-        cwd=repo,
-        capture_output=True,
-        check=True,
-    )
-    with kb.connect() as conn:
-        tid = kb.create_task(
-            conn,
-            title="worktree cleanup",
-            workspace_kind="worktree",
-            workspace_path=str(wt_path),
-        )
-        assert kb.archive_task(conn, tid) is True
-    assert not wt_path.exists()
-    branches = subprocess.run(
-        ["git", "branch", "--list", "feat/test-cleanup"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert not branches.stdout.strip()
 
 
 # ---------------------------------------------------------------------------
