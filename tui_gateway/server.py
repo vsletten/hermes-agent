@@ -15319,6 +15319,13 @@ def _(rid, params: dict) -> dict:
                 _voice_emit("voice.transcript", {"no_speech_limit": True})
                 _resume_voice_wake()
 
+            def _on_no_speech():
+                # A capture ended with no transcribable speech (empty
+                # transcript, below the no-speech limit). Surface it so the
+                # TUI can clear its "listening" state instead of hanging.
+                _voice_emit("voice.transcript", {"no_speech": True})
+                _resume_voice_wake()
+
             def _on_stop_phrase(t):
                 # Explicit user intent: the user SAID a bare stop phrase
                 # ("stop"). End the voice chat exactly like a manual
@@ -15355,6 +15362,7 @@ def _(rid, params: dict) -> dict:
                 on_transcript=_on_transcript,
                 on_status=_on_status,
                 on_silent_limit=_on_silent,
+                on_no_speech=_on_no_speech,
                 silence_threshold=safe_threshold,
                 silence_duration=safe_duration,
                 auto_restart=False,

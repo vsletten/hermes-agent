@@ -28,6 +28,7 @@ from hermes_cli.auth import (
     _auth_store_lock,
     _codex_access_token_is_expiring,
     _decode_jwt_claims,
+    _read_credential_pool_slice_with_source,
     _global_auth_file_path,
     _load_auth_store,
     _load_provider_state,
@@ -648,8 +649,24 @@ def _write_through_provider_state_to_global_root(
 
 
 class CredentialPool:
-    def __init__(self, provider: str, entries: List[PooledCredential]):
+    def __init__(
+        self,
+        provider: str,
+        entries: List[PooledCredential],
+        *,
+        refresh_store_paths: Optional[Dict[str, Path]] = None,
+    ):
         self.provider = provider
+        # Refresh ownership is per credential row, not per pool. A pool loaded
+        # through profile fallback can later receive a newly added profile row;
+        # the borrowed row must still rotate in root while the new row rotates
+        # in the profile. Ordinary pool edits retain their existing active-store
+        # semantics and do not follow this map.
+        active_store_path = auth_mod._auth_file_path()
+        self._refresh_store_paths = {
+            entry.id: (refresh_store_paths or {}).get(entry.id, active_store_path)
+            for entry in entries
+        }
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
@@ -774,14 +791,75 @@ class CredentialPool:
                     self._entries[idx] = new
                     return
 
+    def _refresh_store_path(self, entry: PooledCredential) -> Path:
+        return self._refresh_store_paths.get(
+            entry.id,
+            auth_mod._auth_file_path(),
+        )
+
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+        """Persist runtime pool state without changing xAI row ownership."""
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
+        with self._lock:
+            if self.provider != "xai-oauth":
+                write_credential_pool(
+                    self.provider,
+                    [entry.to_dict() for entry in self._entries],
+                    removed_ids=removed_ids,
+                )
+                return
+
+            entries_by_store: Dict[Path, List[Dict[str, Any]]] = {}
+            for entry in self._entries:
+                entries_by_store.setdefault(
+                    self._refresh_store_path(entry),
+                    [],
+                ).append(entry.to_dict())
+            removed_by_store: Dict[Path, List[str]] = {}
+            for entry_id in removed_ids or []:
+                store_path = self._refresh_store_paths.get(
+                    entry_id,
+                    auth_mod._auth_file_path(),
+                )
+                removed_by_store.setdefault(store_path, []).append(entry_id)
+
+            for store_path in entries_by_store.keys() | removed_by_store.keys():
+                write_credential_pool(
+                    self.provider,
+                    entries_by_store.get(store_path, []),
+                    removed_ids=removed_by_store.get(store_path),
+                    target_path=store_path,
+                )
+            for entry_id in removed_ids or []:
+                self._refresh_store_paths.pop(entry_id, None)
+
+    def _persist_to_active_store(self, *, removed_ids: Optional[List[str]] = None) -> None:
+        """Persist an explicit profile mutation and make that slice authoritative."""
         with self._lock:
             write_credential_pool(
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
+            )
+            active_store_path = auth_mod._auth_file_path()
+            self._refresh_store_paths = {
+                entry.id: active_store_path for entry in self._entries
+            }
+
+    def _persist_refreshed_entry(self, entry: PooledCredential) -> None:
+        """Persist one rotated xAI row to the store that owns its grant.
+
+        This deliberately does not persist the whole in-memory fallback pool:
+        ordinary add/remove/reset operations retain their active-profile
+        semantics. ``write_credential_pool`` merges untouched owner rows under
+        the same store lock, so updating one token pair cannot drop siblings.
+        """
+        with self._lock:
+            write_credential_pool(
+                self.provider,
+                [entry.to_dict()],
+                target_path=self._refresh_store_path(entry),
             )
 
     def _is_terminal_auth_failure(
@@ -1009,9 +1087,15 @@ class CredentialPool:
         if self.provider != "xai-oauth" or entry.source != "device_code":
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
-                state = _load_provider_state(auth_store, "xai-oauth")
+            store_path = self._refresh_store_path(entry)
+            with _auth_store_lock(target_path=store_path):
+                auth_store = _load_auth_store(store_path)
+                providers = auth_store.get("providers")
+                state = (
+                    providers.get("xai-oauth")
+                    if isinstance(providers, dict)
+                    else None
+                )
             if not isinstance(state, dict):
                 return entry
             tokens = state.get("tokens")
@@ -1064,10 +1148,19 @@ class CredentialPool:
         if self.provider != "xai-oauth":
             return entry
         try:
+            auth_store = _load_auth_store(self._refresh_store_path(entry))
+            credential_pool = auth_store.get("credential_pool")
+            persisted_entries = (
+                credential_pool.get(self.provider)
+                if isinstance(credential_pool, dict)
+                else None
+            )
             persisted = next(
                 (
                     payload
-                    for payload in read_credential_pool(self.provider)
+                    for payload in (
+                        persisted_entries if isinstance(persisted_entries, list) else []
+                    )
                     if isinstance(payload, dict) and payload.get("id") == entry.id
                 ),
                 None,
@@ -1188,6 +1281,40 @@ class CredentialPool:
         # and must not write back to the singleton.  All singleton-seeded
         # device-code sources (nous, openai-codex, xAI) use ``device_code``.
         if entry.source != "device_code":
+            return
+        if self.provider == "xai-oauth":
+            store_path = self._refresh_store_path(entry)
+            try:
+                with _auth_store_lock(target_path=store_path):
+                    auth_store = _load_auth_store(store_path)
+                    providers = auth_store.get("providers")
+                    state = (
+                        providers.get("xai-oauth")
+                        if isinstance(providers, dict)
+                        else None
+                    )
+                    if not isinstance(state, dict):
+                        return
+                    tokens = state.get("tokens")
+                    if not isinstance(tokens, dict):
+                        return
+                    tokens["access_token"] = entry.access_token
+                    if entry.refresh_token:
+                        tokens["refresh_token"] = entry.refresh_token
+                    if entry.last_refresh:
+                        state["last_refresh"] = entry.last_refresh
+                    _store_provider_state(
+                        auth_store,
+                        "xai-oauth",
+                        state,
+                        set_active=False,
+                    )
+                    _save_auth_store(auth_store, target_path=store_path)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to sync xAI OAuth pool entry back to owner store: %s",
+                    exc,
+                )
             return
         try:
             with _auth_store_lock():
@@ -1326,7 +1453,8 @@ class CredentialPool:
                 else self._sync_xai_oauth_entry_from_pool_store
             )
             with _auth_store_lock(
-                timeout_seconds=self._single_use_refresh_lock_timeout()
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+                target_path=self._refresh_store_path(entry),
             ):
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
@@ -1510,14 +1638,23 @@ class CredentialPool:
                 # session does not re-seed the same revoked credentials, and
                 # remove all singleton-seeded xAI entries from the in-memory
                 # pool. Mirrors the Nous quarantine path above.
-                if auth_mod._is_terminal_xai_oauth_refresh_error(exc):
+                if (
+                    entry.source == "device_code"
+                    and auth_mod._is_terminal_xai_oauth_refresh_error(exc)
+                ):
                     logger.debug(
                         "xAI OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
-                            state = _load_provider_state(auth_store, "xai-oauth") or {}
+                        store_path = self._refresh_store_path(entry)
+                        with _auth_store_lock(target_path=store_path):
+                            auth_store = _load_auth_store(store_path)
+                            providers = auth_store.get("providers")
+                            state = (
+                                providers.get("xai-oauth")
+                                if isinstance(providers, dict)
+                                else None
+                            )
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
                                 if isinstance(tokens, dict):
@@ -1535,8 +1672,16 @@ class CredentialPool:
                                             "relogin_required": True,
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
-                                        _save_provider_state(auth_store, "xai-oauth", state)
-                                        _save_auth_store(auth_store)
+                                        _store_provider_state(
+                                            auth_store,
+                                            "xai-oauth",
+                                            state,
+                                            set_active=False,
+                                        )
+                                        _save_auth_store(
+                                            auth_store,
+                                            target_path=store_path,
+                                        )
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal xAI OAuth state: %s", clear_exc
@@ -1715,11 +1860,20 @@ class CredentialPool:
             last_error_reset_at=None,
         )
         self._replace_entry(entry, updated)
-        self._persist()
-        # Sync refreshed tokens back to auth.json providers so that
-        # _seed_from_singletons() on the next load_pool() sees fresh state
-        # instead of re-seeding stale/consumed tokens.
-        self._sync_device_code_entry_to_auth_store(updated)
+        if self.provider == "xai-oauth":
+            self._persist_refreshed_entry(updated)
+        else:
+            self._persist()
+        # Sync refreshed singleton-backed tokens to providers.<id> so the next
+        # load_pool() does not re-seed stale credentials. Manual xAI pool rows
+        # are independent accounts with no singleton shadow; syncing one would
+        # both clobber a distinct singleton account and invert the root/profile
+        # lock order while a root-fallback pool refresh holds the root lock.
+        if not (
+            self.provider == "xai-oauth"
+            and updated.source == SOURCE_MANUAL_DEVICE_CODE
+        ):
+            self._sync_device_code_entry_to_auth_store(updated)
         return updated
 
     def _codex_quota_restored_upstream(self, entry: PooledCredential) -> bool:
@@ -2350,7 +2504,7 @@ class CredentialPool:
                     new_entries.append(entry)
             if count:
                 self._entries = new_entries
-                self._persist()
+                self._persist_to_active_store()
             return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
@@ -2362,11 +2516,7 @@ class CredentialPool:
                 replace(entry, priority=new_priority)
                 for new_priority, entry in enumerate(self._entries)
             ]
-            write_credential_pool(
-                self.provider,
-                [entry.to_dict() for entry in self._entries],
-                removed_ids=[removed.id],
-            )
+            self._persist_to_active_store(removed_ids=[removed.id])
             if self._current_id == removed.id:
                 self._current_id = None
             return removed
@@ -2401,7 +2551,8 @@ class CredentialPool:
         with self._lock:
             entry = replace(entry, priority=_next_priority(self._entries))
             self._entries.append(entry)
-            self._persist()
+            self._refresh_store_paths[entry.id] = auth_mod._auth_file_path()
+            self._persist_to_active_store()
             return entry
 
 
@@ -3131,11 +3282,22 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    raw_entries = read_credential_pool(provider)
-    disk_ids = {
-        entry.get("id")
+    # xAI's rotating single-use OAuth chain must refresh back into the store
+    # that owns the effective fallback row. This path is transaction metadata,
+    # not the target for normal add/remove/reset pool edits.
+    if provider == "xai-oauth":
+        raw_entries, source_store_path = _read_credential_pool_slice_with_source(
+            provider
+        )
+    else:
+        source_store_path = auth_mod._auth_file_path()
+        raw_entries = read_credential_pool(provider)
+    disk_ids: set[str] = {
+        entry_id
         for entry in raw_entries
-        if isinstance(entry, dict) and entry.get("id")
+        if isinstance(entry, dict)
+        and isinstance(entry_id := entry.get("id"), str)
+        and entry_id
     }
     raw_needs_sanitization = any(
         isinstance(payload, dict)
@@ -3191,5 +3353,10 @@ def load_pool(provider: str) -> CredentialPool:
             provider,
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             removed_ids=disk_ids - new_ids,
+            target_path=source_store_path if provider == "xai-oauth" else None,
         )
-    return CredentialPool(provider, entries)
+    return CredentialPool(
+        provider,
+        entries,
+        refresh_store_paths={entry.id: source_store_path for entry in entries},
+    )

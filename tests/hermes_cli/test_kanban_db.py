@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+
 import time
 import types
 import unittest.mock
@@ -510,10 +511,157 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 # ---------------------------------------------------------------------------
 
 
+def test_respawn_guard_ignores_pr_context_comment_before_first_run(kanban_home):
+    """Pre-run PR context must not strand a finalizer initially or after a crash."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="finalize related PR", assignee="a")
+        kb.add_comment(
+            conn,
+            tid,
+            "orchestrator",
+            "Reconcile https://github.com/example/repo/pull/123 after review.",
+        )
+
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        run_id = task.current_run_id
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='crashed', ended_at=? "
+            "WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        assert kb.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_blocks_pr_comment_after_worker_run(kanban_home):
+    """The duplicate-PR guard still applies when a prior worker may have published."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="publish once", assignee="a")
+        kb.claim_task(conn, tid)
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        run_id = task.current_run_id
+        now = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='crashed', ended_at=? "
+            "WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        # Reassignment after the failed run must not hide publication evidence
+        # written by the profile that actually performed that run.
+        conn.execute("UPDATE tasks SET assignee='b' WHERE id=?", (tid,))
+        conn.commit()
+        kb.add_comment(
+            conn,
+            tid,
+            "a",
+            "Created https://github.com/example/repo/pull/123 before crashing.",
+        )
+
+        assert kb.check_respawn_guard(conn, tid) == "active_pr"
 
 
 
 
+
+
+
+# ---------------------------------------------------------------------------
+# Archive workspace cleanup (local: worktree-preserving archive_task)
+# ---------------------------------------------------------------------------
+
+def _init_git_repo_with_origin(repo: Path) -> None:
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True, check=True)
+    (repo / "README.md").write_text("# Test Repo\n")
+    subprocess.run(["git", "add", "."], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=repo, capture_output=True, check=True)
+    subprocess.run(["git", "update-ref", "refs/remotes/origin/main", "HEAD"], cwd=repo, capture_output=True, check=True)
+
+
+def test_archive_task_removes_scratch_workspace(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="scratch cleanup")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+        (ws / "artifact.txt").write_text("leftover")
+        assert ws.exists()
+        assert kb.archive_task(conn, tid) is True
+    assert not ws.exists()
+
+
+def test_archive_task_keeps_worktree_with_unpushed_commits(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo_with_origin(repo)
+    wt_path = tmp_path / "repo-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", str(wt_path), "-b", "feat/test-cleanup", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    )
+    (wt_path / "feature.txt").write_text("hello\n")
+    subprocess.run(["git", "add", "feature.txt"], cwd=wt_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "feature work"], cwd=wt_path, capture_output=True, check=True)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="worktree cleanup",
+            workspace_kind="worktree",
+            workspace_path=str(wt_path),
+        )
+        assert kb.archive_task(conn, tid) is True
+    assert wt_path.exists()
+
+
+def test_archive_task_removes_worktree_when_no_unpushed_commits(kanban_home, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_git_repo_with_origin(repo)
+    wt_path = tmp_path / "repo-worktree"
+    subprocess.run(
+        ["git", "worktree", "add", str(wt_path), "-b", "feat/test-cleanup", "HEAD"],
+        cwd=repo,
+        capture_output=True,
+        check=True,
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="worktree cleanup",
+            workspace_kind="worktree",
+            workspace_path=str(wt_path),
+        )
+        assert kb.archive_task(conn, tid) is True
+    assert not wt_path.exists()
+    branches = subprocess.run(
+        ["git", "branch", "--list", "feat/test-cleanup"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert not branches.stdout.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +953,14 @@ class TestSharedBoardPaths:
         # never one inherited from whatever the gateway last routed.
         default_home = tmp_path / ".hermes"
         default_home.mkdir()
+        linked_project_home = (
+            tmp_path / "Documents" / "hermes-projects" / "active" / "default"
+        )
+        linked_project_home.mkdir(parents=True)
+        monkeypatch.setenv(
+            "HERMES_PROJECTS_ROOT",
+            str(tmp_path / "Documents" / "hermes-projects"),
+        )
         self._set_home(monkeypatch, tmp_path, default_home)
 
         from gateway import session_context as sc
@@ -850,6 +1006,7 @@ class TestSharedBoardPaths:
         assert env["HERMES_KANBAN_WORKSPACES_ROOT"] == str(
             default_home / "kanban" / "workspaces"
         )
+        assert env["HERMES_KANBAN_PROJECT_HOME"] == str(linked_project_home)
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
         for key in sc._VAR_MAP:

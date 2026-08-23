@@ -1608,6 +1608,45 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
+def _read_credential_pool_slice_with_source(
+    provider_id: str,
+) -> tuple[List[Dict[str, Any]], Path]:
+    """Return one effective pool slice and the auth store that owns it.
+
+    Profile credential-pool reads fall back to the global root when the profile
+    has no entries for a provider. Read each candidate store under its own lock
+    so callers bind the pool snapshot and its persistence target atomically.
+    Rotating OAuth pools can then persist back to that same source store instead
+    of stranding a refreshed single-use token in a disposable profile.
+    """
+    active_path = _auth_file_path()
+    with _auth_store_lock(target_path=active_path):
+        active_store = _load_auth_store(active_path)
+        active_pool = active_store.get("credential_pool")
+        active_entries = (
+            active_pool.get(provider_id) if isinstance(active_pool, dict) else None
+        )
+        if isinstance(active_entries, list) and active_entries:
+            return list(active_entries), active_path
+
+        global_path = _global_auth_file_path()
+        if global_path is not None:
+            # Lock order matches provider-state write-through: profile first,
+            # then global root. Holding both closes the check-profile/read-root
+            # race while avoiding lock inversion with refresh persistence.
+            with _auth_store_lock(target_path=global_path):
+                global_store = _load_auth_store(global_path)
+                global_pool = global_store.get("credential_pool")
+                global_entries = (
+                    global_pool.get(provider_id)
+                    if isinstance(global_pool, dict)
+                    else None
+                )
+                if isinstance(global_entries, list) and global_entries:
+                    return list(global_entries), global_path
+        return [], active_path
+
+
 def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
@@ -1621,7 +1660,10 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     ``hermes auth add <provider>`` inside the profile, profile entries
     fully shadow global for that provider on the next read.
 
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
+    Generic writes go to the profile. Callers that must preserve a provider's
+    rotating single-use credential chain can pass the owning store explicitly
+    to ``write_credential_pool``; xAI runtime fallback does this so refreshes do
+    not strand the replacement token in a disposable profile.
     See issue #18594 follow-up.
     """
     auth_store = _load_auth_store()
@@ -1727,6 +1769,7 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
+    target_path: Optional[Path] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
 
@@ -1744,11 +1787,14 @@ def write_credential_pool(
     snapshot cannot erase a cooldown/quarantine another process just wrote.
 
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
-    merge does not resurrect them from the on-disk copy.
+    merge does not resurrect them from the on-disk copy. ``target_path`` lets a
+    profile-fallback runtime persist a rotating credential back to the auth
+    store that owned the entry; callers otherwise retain profile-local writes.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    store_path = target_path or _auth_file_path()
+    with _auth_store_lock(target_path=store_path):
+        auth_store = _load_auth_store(store_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1786,7 +1832,7 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        return _save_auth_store(auth_store, target_path=store_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:

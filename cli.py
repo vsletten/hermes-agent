@@ -4398,6 +4398,34 @@ def _bind_prompt_submit_keys(
         kb.add("c-j")(handler)
 
 
+def _consume_backslash_submit_newline(buffer) -> bool:
+    r"""On macOS, treat a trailing backslash + Enter as a literal newline.
+
+    This gives Terminal.app/iTerm users a terminal-agnostic multiline fallback
+    even when Option/Shift/Ctrl/Cmd+Enter are intercepted or collapsed before
+    prompt_toolkit sees them. It also matches the `\\` + Enter sequence the
+    Hermes TUI installs in VS Code/Cursor/Windsurf terminals.
+
+    Only a *single* trailing backslash immediately before the cursor is
+    consumed. Double-backslash stays literal so users can still submit text
+    ending in `\\` by typing two backslashes.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        before = buffer.document.current_line_before_cursor
+    except Exception:
+        return False
+    if not before.endswith("\\") or before.endswith("\\\\"):
+        return False
+    try:
+        buffer.delete_before_cursor(count=1)
+        buffer.insert_text("\n")
+        return True
+    except Exception:
+        return False
+
+
 def _disable_prompt_toolkit_cpr_warning(app) -> None:
     """Let prompt_toolkit fall back from CPR without printing into the prompt."""
     try:
@@ -14365,7 +14393,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Start capturing audio from the microphone."""
         if getattr(self, '_should_exit', False):
             return
-        from tools.voice_mode import create_audio_recorder, check_voice_requirements
+        from tools.voice_mode import create_audio_recorder, check_voice_requirements, _voice_capture_install_hint
 
         reqs = check_voice_requirements()
         if not reqs["audio_available"]:
@@ -14384,7 +14412,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
             raise RuntimeError(
                 "Voice mode requires sounddevice and numpy.\n"
-                f"Install with: {sys.executable} -m pip install sounddevice numpy"
+                f"Install with: {_voice_capture_install_hint()}"
             )
         if not reqs.get("stt_available", reqs.get("stt_key_set")):
             raise RuntimeError(
@@ -14937,7 +14965,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _cprint(f"{_DIM}Voice mode is already enabled.{_RST}")
             return
 
-        from tools.voice_mode import check_voice_requirements, detect_audio_environment
+        from tools.voice_mode import check_voice_requirements, detect_audio_environment, _voice_capture_install_hint
 
         # Environment detection -- warn and block in incompatible environments
         env_check = detect_audio_environment()
@@ -14958,7 +14986,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"  {_DIM}Then install/update the Termux:API Android app for microphone capture{_RST}")
                     _cprint(f"  {_BOLD}Option 2: pkg install python-numpy portaudio && python -m pip install sounddevice{_RST}")
                 else:
-                    _cprint(f"\n  {_BOLD}Install: {sys.executable} -m pip install {' '.join(reqs['missing_packages'])}{_RST}")
+                    _cprint(f"\n  {_BOLD}Install: {_voice_capture_install_hint()}{_RST}")
             return
 
         with self._voice_lock:
@@ -17433,6 +17461,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 name="agent-runtime-prewarm",
                 daemon=True,
             ).start()
+
+        # Auto-enable voice mode if config has voice.enabled: true
+        try:
+            _voice_cfg = self.config.get("voice", {})
+            if isinstance(_voice_cfg, dict) and _voice_cfg.get("enabled", False):
+                self._enable_voice_mode()
+        except Exception:
+            pass
 
         # Redaction opt-out warning (#17691): ON by default, loud when off.
         # The redactor snapshots its state at import time so any toggle now

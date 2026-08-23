@@ -7891,6 +7891,179 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
+def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 15) -> str:
+    """Run a git command and return stripped stdout or raise RuntimeError."""
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        stderr = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(stderr or f"git {' '.join(args)} failed")
+    return (proc.stdout or "").strip()
+
+
+def _git_has_unpushed_commits(worktree: Path) -> bool:
+    """Return True if HEAD has commits not reachable from any remote ref."""
+    try:
+        out = _git_stdout(
+            ["log", "--oneline", "HEAD", "--not", "--remotes"],
+            cwd=worktree,
+            timeout=10,
+        )
+    except Exception:
+        # On inspection failure, keep the worktree instead of risking deletion.
+        return True
+    return bool(out)
+
+
+def _git_common_repo_root(worktree: Path) -> Path:
+    """Resolve the owning repository root for a git worktree path."""
+    common_dir_raw = _git_stdout(["rev-parse", "--git-common-dir"], cwd=worktree)
+    common_dir = Path(common_dir_raw).expanduser()
+    if not common_dir.is_absolute():
+        common_dir = (worktree / common_dir).resolve()
+    return common_dir.parent
+
+
+def cleanup_archived_workspace(task: Optional[Task], *, board: Optional[str] = None) -> dict[str, Any]:
+    """Best-effort cleanup for an archived task's workspace.
+
+    Policy:
+    - ``scratch``: remove immediately once archived.
+    - ``worktree``: remove only when there are no unpushed commits.
+    - ``dir``: never auto-delete; it's treated as shared persistent state.
+    """
+    if task is None:
+        return {"status": "missing_task"}
+    kind = task.workspace_kind or "scratch"
+    raw_path = task.workspace_path
+    if kind == "dir":
+        return {
+            "status": "kept",
+            "kind": kind,
+            "reason": "persistent_dir",
+            "path": raw_path,
+        }
+    if kind == "scratch":
+        scratch_root = workspaces_root(board=board)
+        path = Path(raw_path or (scratch_root / task.id))
+        try:
+            resolved_root = scratch_root.resolve()
+            resolved_path = path.resolve()
+        except OSError as exc:
+            return {
+                "status": "error",
+                "kind": kind,
+                "path": str(path),
+                "reason": f"resolve_failed: {exc}",
+            }
+        try:
+            resolved_path.relative_to(resolved_root)
+        except ValueError:
+            return {
+                "status": "kept",
+                "kind": kind,
+                "path": str(path),
+                "reason": "outside_scratch_root",
+            }
+        if not resolved_path.exists():
+            return {
+                "status": "none",
+                "kind": kind,
+                "path": str(resolved_path),
+                "reason": "already_missing",
+            }
+        try:
+            import shutil
+            shutil.rmtree(resolved_path, ignore_errors=False)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "kind": kind,
+                "path": str(resolved_path),
+                "reason": f"remove_failed: {exc}",
+            }
+        return {
+            "status": "removed",
+            "kind": kind,
+            "path": str(resolved_path),
+        }
+    if kind == "worktree":
+        if not raw_path:
+            return {
+                "status": "kept",
+                "kind": kind,
+                "reason": "missing_workspace_path",
+            }
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            return {
+                "status": "kept",
+                "kind": kind,
+                "path": str(path),
+                "reason": "non_absolute_path",
+            }
+        if not path.exists():
+            return {
+                "status": "none",
+                "kind": kind,
+                "path": str(path),
+                "reason": "already_missing",
+            }
+        try:
+            _git_stdout(["rev-parse", "--is-inside-work-tree"], cwd=path, timeout=10)
+        except Exception as exc:
+            return {
+                "status": "kept",
+                "kind": kind,
+                "path": str(path),
+                "reason": f"not_git_worktree: {exc}",
+            }
+        if _git_has_unpushed_commits(path):
+            return {
+                "status": "kept",
+                "kind": kind,
+                "path": str(path),
+                "reason": "unpushed_commits",
+            }
+        branch = ""
+        try:
+            branch = _git_stdout(["branch", "--show-current"], cwd=path, timeout=10)
+        except Exception:
+            branch = ""
+        try:
+            repo_root = _git_common_repo_root(path)
+            _git_stdout(["worktree", "remove", str(path), "--force"], cwd=repo_root, timeout=20)
+            with contextlib.suppress(Exception):
+                _git_stdout(["worktree", "prune"], cwd=repo_root, timeout=15)
+            if branch:
+                with contextlib.suppress(Exception):
+                    _git_stdout(["branch", "-D", branch], cwd=repo_root, timeout=10)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "kind": kind,
+                "path": str(path),
+                "reason": f"worktree_remove_failed: {exc}",
+            }
+        return {
+            "status": "removed",
+            "kind": kind,
+            "path": str(path),
+            "branch": branch or None,
+        }
+    return {
+        "status": "kept",
+        "kind": kind,
+        "path": raw_path,
+        "reason": "unknown_workspace_kind",
+    }
+
+
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
@@ -9435,9 +9608,12 @@ def check_respawn_guard(
         arrives AFTER that completion — that's a deliberate re-run request.
 
     ``"active_pr"``
-        A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
-        opened a PR; re-spawning risks a duplicate PR on the same task.
+        After at least one worker run, a GitHub PR URL appears in a comment
+        authored by the profile that ran the task after that run started (and within
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior
+        worker already opened a PR; re-spawning risks a duplicate PR on the
+        same task.  Comments written before a task's first run are task
+        context, not evidence that this task already published a PR.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -9525,14 +9701,32 @@ def check_respawn_guard(
         if not requeued_after:
             return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    # 4. GitHub PR URL in a recent comment after a prior worker run — that
+    #    worker may already have opened a PR.  Never apply this guard to a
+    #    never-started task: orchestrators legitimately put related PR URLs in
+    #    review/finalizer context comments before the first dispatch. Treating
+    #    those comments as publication evidence strands the task in ``ready``.
+    prior_run = conn.execute(
+        "SELECT started_at, profile FROM task_runs WHERE task_id = ? "
+        "ORDER BY started_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if prior_run is not None:
+        pr_cutoff = max(
+            now - _RESPAWN_GUARD_PR_WINDOW,
+            int(prior_run["started_at"] or 0),
+        )
+        for c in conn.execute(
+            "SELECT body, author FROM task_comments "
+            "WHERE task_id = ? AND created_at >= ?",
+            (task_id, pr_cutoff),
+        ).fetchall():
+            if (
+                c["author"] == prior_run["profile"]
+                and c["body"]
+                and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
+            ):
+                return "active_pr"
 
     return None
 
@@ -10816,13 +11010,27 @@ def _default_spawn(
     # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
+    resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
     _retag_legacy_worker_sessions(env["HERMES_KANBAN_WORKSPACES_ROOT"])
+    project_home = (
+        os.environ.get("HERMES_KANBAN_PROJECT_HOME")
+        or os.environ.get("HERMES_PROJECT_HOME")
+        or os.path.join(
+            os.path.expanduser(
+                os.environ.get("HERMES_PROJECTS_ROOT", "~/Documents/hermes-projects")
+            ),
+            "active",
+            resolved_board,
+        )
+    )
+    project_home = os.path.abspath(os.path.expanduser(project_home))
+    if os.path.exists(project_home):
+        env["HERMES_KANBAN_PROJECT_HOME"] = project_home
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
     # board slug still forces it to the right directory.
-    resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is

@@ -362,6 +362,7 @@ _continuous_on_silent_limit: Optional[Callable[[], None]] = None
 # reporting "no speech detected". When unset, on_silent_limit fires as a
 # fallback so older callers still turn voice off.
 _continuous_on_stop_phrase: Optional[Callable[[str], None]] = None
+_continuous_on_no_speech: Optional[Callable[[], None]] = None
 _continuous_no_speech_count = 0
 _CONTINUOUS_NO_SPEECH_LIMIT = 3
 
@@ -433,6 +434,7 @@ def start_continuous(
     on_transcript: Callable[[str], None],
     on_status: Optional[Callable[[str], None]] = None,
     on_silent_limit: Optional[Callable[[], None]] = None,
+    on_no_speech: Optional[Callable[[], None]] = None,
     silence_threshold: int = 200,
     silence_duration: float = 3.0,
     auto_restart: bool = True,
@@ -470,6 +472,7 @@ def start_continuous(
     global _continuous_on_transcript, _continuous_on_status, _continuous_on_silent_limit
     global _continuous_on_stop_phrase
     global _continuous_no_speech_count
+    global _continuous_on_no_speech, _continuous_no_speech_count
 
     with _continuous_lock:
         if _continuous_active:
@@ -484,6 +487,7 @@ def start_continuous(
         _continuous_on_status = on_status
         _continuous_on_silent_limit = on_silent_limit
         _continuous_on_stop_phrase = on_stop_phrase
+        _continuous_on_no_speech = on_no_speech
         if auto_restart:
             _continuous_no_speech_count = 0
 
@@ -541,6 +545,7 @@ def stop_continuous(force_transcribe: bool = False) -> None:
     global _continuous_active, _continuous_on_transcript, _continuous_stopping
     global _continuous_on_status, _continuous_on_silent_limit
     global _continuous_on_stop_phrase
+    global _continuous_on_status, _continuous_on_silent_limit, _continuous_on_no_speech
     global _continuous_recorder, _continuous_no_speech_count
 
     with _continuous_lock:
@@ -552,6 +557,7 @@ def stop_continuous(force_transcribe: bool = False) -> None:
         on_transcript = _continuous_on_transcript
         on_silent_limit = _continuous_on_silent_limit
         on_stop_phrase = _continuous_on_stop_phrase
+        on_no_speech = _continuous_on_no_speech
         auto_restart = _continuous_auto_restart
         track_no_speech = force_transcribe and not auto_restart
         _continuous_stopping = rec is not None
@@ -559,6 +565,7 @@ def stop_continuous(force_transcribe: bool = False) -> None:
         _continuous_on_status = None
         _continuous_on_silent_limit = None
         _continuous_on_stop_phrase = None
+        _continuous_on_no_speech = None
         if not track_no_speech:
             _continuous_no_speech_count = 0
 
@@ -624,6 +631,11 @@ def stop_continuous(force_transcribe: bool = False) -> None:
                             on_transcript(transcript)
                         except Exception as e:
                             logger.warning("on_transcript callback raised: %s", e)
+                    elif on_no_speech:
+                        try:
+                            on_no_speech()
+                        except Exception as e:
+                            logger.warning("on_no_speech callback raised: %s", e)
 
                     if track_no_speech:
                         held = _voice_activity_held()
@@ -710,6 +722,7 @@ def _continuous_on_silence() -> None:
         on_status = _continuous_on_status
         on_silent_limit = _continuous_on_silent_limit
         on_stop_phrase = _continuous_on_stop_phrase
+        on_no_speech = _continuous_on_no_speech
 
     if rec is None:
         _debug("_continuous_on_silence: no recorder — abort")
@@ -804,6 +817,11 @@ def _continuous_on_silence() -> None:
             on_transcript(transcript)
         except Exception as e:
             logger.warning("on_transcript callback raised: %s", e)
+    elif not transcript and on_no_speech:
+        try:
+            on_no_speech()
+        except Exception as e:
+            logger.warning("on_no_speech callback raised: %s", e)
 
     if should_halt:
         _debug(

@@ -70,10 +70,336 @@ def profile_and_root(tmp_path, monkeypatch):
     return profile_path, root_path
 
 
+def test_pool_only_global_xai_refresh_persists_rotated_chain_to_root(
+    profile_and_root, monkeypatch
+):
+    """A profile fallback pool must rotate in its owning root store.
+
+    A device-code login may exist only as ``credential_pool.xai-oauth`` with
+    source ``manual:device_code``. Disposable profiles intentionally omit xAI
+    credentials and read that row through the global fallback. Persisting the
+    rotated single-use chain into the disposable profile strands it at cleanup
+    and leaves the consumed token in root.
+    """
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "xai-root-only",
+                        "label": "xAI OAuth (device-code)",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    }
+                ]
+            },
+        },
+    )
+
+    def fake_refresh(access_token, refresh_token, **_kwargs):
+        assert access_token == "old-access"
+        assert refresh_token == "old-refresh"
+        assert getattr(A._auth_lock_holder_for(root_path), "depth", 0) > 0
+        return {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2026-08-11T22:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_xai_oauth_pure", fake_refresh)
+    singleton_sync_calls = []
+    monkeypatch.setattr(
+        CP.CredentialPool,
+        "_sync_device_code_entry_to_auth_store",
+        lambda self, entry: singleton_sync_calls.append(entry.id),
+    )
+    pool = CP.load_pool("xai-oauth")
+    entry = pool._entries[0]
+
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert refreshed.refresh_token == "rotated-refresh"
+    assert singleton_sync_calls == []
+    root = _read_store(root_path)
+    assert root["credential_pool"]["xai-oauth"][0]["access_token"] == "rotated-access"
+    assert root["credential_pool"]["xai-oauth"][0]["refresh_token"] == "rotated-refresh"
+    assert _read_store(profile_path) == {"version": 1}
 
 
+def test_root_fallback_singleton_xai_refresh_updates_root_provider_state(
+    profile_and_root,
+    monkeypatch,
+):
+    """A singleton-backed fallback row must sync within its root owner store."""
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    },
+                    "last_refresh": "2026-08-11T20:00:00Z",
+                }
+            },
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "xai-root-singleton",
+                        "label": "root xAI singleton",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    }
+                ]
+            },
+        },
+    )
+
+    def fake_refresh(access_token, refresh_token, **_kwargs):
+        assert access_token == "old-access"
+        assert refresh_token == "old-refresh"
+        assert getattr(A._auth_lock_holder_for(root_path), "depth", 0) > 0
+        return {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2026-08-11T22:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_xai_oauth_pure", fake_refresh)
+    pool = CP.load_pool("xai-oauth")
+    refreshed = pool._refresh_entry(pool._entries[0], force=True)
+
+    assert refreshed is not None
+    root = _read_store(root_path)
+    root_pool_tokens = root["credential_pool"]["xai-oauth"][0]
+    root_provider_tokens = root["providers"]["xai-oauth"]["tokens"]
+    assert root_pool_tokens["access_token"] == "rotated-access"
+    assert root_pool_tokens["refresh_token"] == "rotated-refresh"
+    assert root_provider_tokens["access_token"] == "rotated-access"
+    assert root_provider_tokens["refresh_token"] == "rotated-refresh"
+    assert _read_store(profile_path) == {"version": 1}
 
 
+def test_profile_add_on_root_fallback_remains_profile_local(
+    profile_and_root,
+    monkeypatch,
+):
+    """Refresh ownership must not redirect user-initiated pool edits to root."""
+    profile_path, root_path = profile_and_root
+    root_entry = {
+        "id": "xai-root-only",
+        "label": "root xAI",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "manual:device_code",
+        "access_token": "root-access",
+        "refresh_token": "root-refresh",
+    }
+    _write_store(profile_path, {"version": 1})
+    _write_store(
+        root_path,
+        {"version": 1, "credential_pool": {"xai-oauth": [root_entry]}},
+    )
+
+    pool = CP.load_pool("xai-oauth")
+    pool.add_entry(
+        PooledCredential(
+            provider="xai-oauth",
+            id="xai-profile-new",
+            label="profile xAI",
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=0,
+            source="manual:device_code",
+            access_token="profile-access",
+            refresh_token="profile-refresh",
+        )
+    )
+
+    assert _read_store(root_path)["credential_pool"]["xai-oauth"] == [root_entry]
+    profile_entries = _read_store(profile_path)["credential_pool"]["xai-oauth"]
+    assert [entry["id"] for entry in profile_entries] == [
+        "xai-root-only",
+        "xai-profile-new",
+    ]
+
+    def fake_refresh(access_token, refresh_token, **_kwargs):
+        assert access_token == "profile-access"
+        assert refresh_token == "profile-refresh"
+        assert getattr(A._auth_lock_holder_for(profile_path), "depth", 0) > 0
+        return {
+            "access_token": "profile-rotated-access",
+            "refresh_token": "profile-rotated-refresh",
+            "last_refresh": "2026-08-11T22:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_xai_oauth_pure", fake_refresh)
+    added = next(entry for entry in pool._entries if entry.id == "xai-profile-new")
+    refreshed = pool._refresh_entry(added, force=True)
+
+    assert refreshed is not None
+    assert refreshed.refresh_token == "profile-rotated-refresh"
+    assert _read_store(root_path)["credential_pool"]["xai-oauth"] == [root_entry]
+    profile_entries = _read_store(profile_path)["credential_pool"]["xai-oauth"]
+    profile_added = next(entry for entry in profile_entries if entry["id"] == "xai-profile-new")
+    assert profile_added["refresh_token"] == "profile-rotated-refresh"
+
+
+def test_root_fallback_runtime_status_does_not_create_profile_shadow(
+    profile_and_root,
+):
+    """Runtime cooldown writes follow the borrowed row without re-homing it."""
+    profile_path, root_path = profile_and_root
+    root_entry = {
+        "id": "xai-root-only",
+        "label": "root xAI",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "manual:device_code",
+        "access_token": "root-access",
+        "refresh_token": "root-refresh",
+    }
+    _write_store(profile_path, {"version": 1})
+    _write_store(
+        root_path,
+        {"version": 1, "credential_pool": {"xai-oauth": [root_entry]}},
+    )
+
+    pool = CP.load_pool("xai-oauth")
+    pool._mark_exhausted(pool._entries[0], 429)
+
+    root = _read_store(root_path)
+    persisted = root["credential_pool"]["xai-oauth"][0]
+    assert persisted["id"] == "xai-root-only"
+    assert persisted["last_status"] == CP.STATUS_EXHAUSTED
+    assert _read_store(profile_path) == {"version": 1}
+
+
+def test_concurrent_profile_fallback_refreshes_spend_root_token_once(
+    profile_and_root, monkeypatch
+):
+    """Two fallback pools serialize refresh against the shared root row."""
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "xai-oauth": [
+                    {
+                        "id": "xai-root-only",
+                        "label": "xAI OAuth (device-code)",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    }
+                ]
+            },
+        },
+    )
+    pools = [CP.load_pool("xai-oauth"), CP.load_pool("xai-oauth")]
+    refresh_calls = []
+
+    def fake_refresh(access_token, refresh_token, **_kwargs):
+        refresh_calls.append((access_token, refresh_token))
+        assert getattr(A._auth_lock_holder_for(root_path), "depth", 0) > 0
+        return {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2026-08-11T22:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_xai_oauth_pure", fake_refresh)
+    barrier = threading.Barrier(3)
+    refreshed = []
+
+    def run(pool):
+        barrier.wait()
+        refreshed.append(pool._refresh_entry(pool._entries[0], force=True))
+
+    workers = [threading.Thread(target=run, args=(pool,)) for pool in pools]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+
+    assert refresh_calls == [("old-access", "old-refresh")]
+    assert len(refreshed) == 2
+    assert all(item and item.refresh_token == "rotated-refresh" for item in refreshed)
+    root = _read_store(root_path)
+    assert root["credential_pool"]["xai-oauth"][0]["refresh_token"] == (
+        "rotated-refresh"
+    )
+    assert _read_store(profile_path) == {"version": 1}
+
+
+def test_profile_owned_xai_pool_refresh_stays_in_profile(profile_and_root, monkeypatch):
+    """A profile-owned pool must keep shadowing root after token rotation."""
+    profile_path, root_path = profile_and_root
+    profile_entry = {
+        "id": "xai-profile",
+        "label": "profile xAI",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "manual:device_code",
+        "access_token": "profile-access",
+        "refresh_token": "profile-refresh",
+    }
+    root_entry = {
+        **profile_entry,
+        "id": "xai-root",
+        "label": "root xAI",
+        "access_token": "root-access",
+        "refresh_token": "root-refresh",
+    }
+    _write_store(
+        profile_path,
+        {"version": 1, "credential_pool": {"xai-oauth": [profile_entry]}},
+    )
+    _write_store(
+        root_path,
+        {"version": 1, "credential_pool": {"xai-oauth": [root_entry]}},
+    )
+
+    def fake_refresh(access_token, refresh_token, **_kwargs):
+        assert access_token == "profile-access"
+        assert refresh_token == "profile-refresh"
+        assert getattr(A._auth_lock_holder_for(profile_path), "depth", 0) > 0
+        return {
+            "access_token": "profile-rotated-access",
+            "refresh_token": "profile-rotated-refresh",
+            "last_refresh": "2026-08-11T22:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_xai_oauth_pure", fake_refresh)
+    pool = CP.load_pool("xai-oauth")
+    refreshed = pool._refresh_entry(pool._entries[0], force=True)
+
+    assert refreshed is not None
+    profile = _read_store(profile_path)
+    assert profile["credential_pool"]["xai-oauth"][0]["refresh_token"] == (
+        "profile-rotated-refresh"
+    )
+    assert _read_store(root_path)["credential_pool"]["xai-oauth"] == [root_entry]
 
 
 def test_global_write_through_preserves_concurrent_root_update(
