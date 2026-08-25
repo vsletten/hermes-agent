@@ -1910,9 +1910,18 @@ def create_job(
     if repeat is not None and repeat <= 0:
         repeat = None
 
-    # Auto-set repeat=1 for one-shot schedules if not specified
+    # Auto-set repeat=1 for one-shot schedules if not specified. A finite repeat
+    # greater than one on a one-shot can never fire again because the schedule
+    # has no next occurrence; reject it instead of persisting a misleading
+    # ``1/N completed`` job. Recurring intervals require the explicit ``every``
+    # grammar.
     if parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
+    elif parsed_schedule["kind"] == "once" and repeat != 1:
+        raise ValueError(
+            f"One-shot schedule {schedule!r} cannot repeat {repeat} times. "
+            f"Use 'every {schedule}' for a recurring interval."
+        )
 
     # Default delivery to origin if available, otherwise local
     if deliver is None:
@@ -2108,9 +2117,9 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
     try:
-        from cron.executions import latest_executions
+        from cron.executions import current_executions
 
-        latest = latest_executions([job.get("id", "") for job in jobs])
+        latest = current_executions([job.get("id", "") for job in jobs])
     except Exception:
         latest = {}
     for job in jobs:

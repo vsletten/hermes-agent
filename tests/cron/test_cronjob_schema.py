@@ -19,3 +19,12 @@ def test_cronjob_schema_action_description_flags_create_requirements():
     assert "REQUIRED" in action_desc
 
 
+def test_cronjob_schema_distinguishes_one_shot_duration_from_recurring_interval():
+    """Models must not turn a requested watchdog into a one-shot by mistake."""
+    from tools.cronjob_tools import CRONJOB_SCHEMA
+
+    schedule_desc = CRONJOB_SCHEMA["parameters"]["properties"]["schedule"]["description"]
+    assert "'30m' (one-shot" in schedule_desc
+    assert "'every 30m' (recurring" in schedule_desc
+
+

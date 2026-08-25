@@ -613,6 +613,16 @@ _running_futures: dict = {}
 # future marker — it is ``_FUTURE_PENDING`` until the real future lands.
 _FUTURE_PENDING = object()
 
+
+class _ThreadRunHandle:
+    """Future-shaped liveness handle for direct/manual cron runner threads."""
+
+    def __init__(self, thread: threading.Thread) -> None:
+        self._thread = thread
+
+    def done(self) -> bool:
+        return not self._thread.is_alive()
+
 # Countable signal for unified-health: how many stale claims this process has
 # force-released, and the most recent ones.  Exposed via
 # ``get_inflight_guard_stats()`` and mirrored to a JSONL under the cron dir so
@@ -723,6 +733,21 @@ def release_running_job(job_id: str) -> None:
         _running_job_ids.discard(job_id)
         _running_since.pop(job_id, None)
         _running_futures.pop(job_id, None)
+
+
+def attach_running_job_to_current_thread(job_id: str) -> None:
+    """Replace the pre-submit sentinel with the live manual runner thread.
+
+    ``try_register_running_job`` is shared by scheduler-pool dispatch and
+    direct ``cronjob(action='run')`` dispatch. The latter does not own a
+    scheduler Future, so leaving ``_FUTURE_PENDING`` installed makes the stale
+    sweep treat a healthy manual run as a hung submit path. A thread-backed
+    handle gives the sweep the same ``done()`` contract as a real Future.
+    """
+    with _running_lock:
+        if job_id not in _running_job_ids:
+            raise RuntimeError(f"cron job {job_id!r} is not registered as running")
+        _running_futures[job_id] = _ThreadRunHandle(threading.current_thread())
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -924,8 +949,8 @@ def sweep_stale_inflight(due_jobs: Optional[list] = None) -> list:
     _latest: dict = {}
     if _ledger_candidates:
         try:
-            from cron.executions import latest_executions as _latest_execs
-            _latest = _latest_execs(_ledger_candidates)
+            from cron.executions import current_executions as _current_execs
+            _latest = _current_execs(_ledger_candidates)
         except Exception:
             _latest = {}
 
@@ -6211,10 +6236,15 @@ def run_job(
                 or "agent reported failure"
             )
             raise RuntimeError(_err_text)
+        max_iteration_error = None
         if max_iteration_summary:
+            max_iteration_error = (
+                "Agent reached the configured iteration limit before completing "
+                f"the cron task ({turn_exit_reason})."
+            )
             logger.warning(
-                "Job '%s' reached the iteration limit but produced a final fallback response; "
-                "delivering the response instead of failing the cron run",
+                "Job '%s' reached the iteration limit and is incomplete; "
+                "preserving the fallback response while failing the cron run",
                 job_name,
             )
 
@@ -6269,7 +6299,8 @@ def run_job(
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
         
-        output = f"""# Cron Job: {job_name}
+        heading_suffix = " (INCOMPLETE)" if max_iteration_summary else ""
+        output = f"""# Cron Job: {job_name}{heading_suffix}
 
 **Job ID:** {job_id}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -6284,7 +6315,10 @@ def run_job(
 {logged_response}
 """
         
-        logger.info("Job '%s' completed successfully", job_name)
+        if max_iteration_summary:
+            logger.error("Job '%s' stopped incomplete at the iteration limit", job_name)
+        else:
+            logger.info("Job '%s' completed successfully", job_name)
 
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
@@ -6300,9 +6334,14 @@ def run_job(
             "deliver_target": job.get("deliver"),
             "model": model or None,
             "duration_ms": _audit_duration_ms,
-            "error": None,
+            "error": max_iteration_error,
         })
-        return True, output, final_response, None
+        return (
+            not max_iteration_summary,
+            output,
+            final_response,
+            max_iteration_error,
+        )
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"

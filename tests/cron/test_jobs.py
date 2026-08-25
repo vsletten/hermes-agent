@@ -242,6 +242,11 @@ class TestJobCRUD:
         job = create_job(prompt="One-shot", schedule="1h")
         assert job["repeat"]["times"] == 1
 
+    def test_repeated_one_shot_is_rejected_with_recurring_hint(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="every 5m"):
+            create_job(prompt="watchdog", schedule="5m", repeat=131)
+        assert load_jobs() == []
+
     def test_rejects_stale_past_one_shot_at_creation(self, tmp_cron_dir, monkeypatch):
         now = datetime(2026, 3, 18, 4, 30, 0, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)

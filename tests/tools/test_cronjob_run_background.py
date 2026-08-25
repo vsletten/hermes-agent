@@ -18,6 +18,7 @@ from unittest.mock import patch
 
 from tools.cronjob_tools import (
     _try_dispatch_background_run,
+    cancel_cron_run,
     cronjob,
 )
 
@@ -56,6 +57,45 @@ def _bound_session_key(key="agent:main:telegram:dm:123"):
 
 
 class TestBackgroundDispatch:
+    def test_background_manual_run_can_be_cancelled_by_job_id(self):
+        """Reassignment/removal must stop the already-running cron agent."""
+        import time
+
+        run_started = threading.Event()
+        run_stopped = threading.Event()
+
+        def cancellable_run(job, **kwargs):
+            cancel_event = kwargs.get("cancel_event")
+            assert cancel_event is not None
+            run_started.set()
+            assert cancel_event.wait(timeout=5.0)
+            run_stopped.set()
+            return True
+
+        with _bound_session_key("agent:main:telegram:dm:cancel"):
+            with patch(
+                "tools.cronjob_tools.claim_job_for_fire",
+                return_value={
+                    **_job("job-bg-cancel"),
+                    "fire_claim": {"by": "bg-owner"},
+                },
+            ), patch(
+                "cron.scheduler.run_one_job", side_effect=cancellable_run
+            ), patch(
+                "tools.cronjob_tools.get_job",
+                return_value={"last_status": "error", "last_error": "cancelled"},
+            ):
+                result = _try_dispatch_background_run(_job("job-bg-cancel"))
+                assert result["dispatched"] is True
+                assert run_started.wait(timeout=5.0)
+                assert cancel_cron_run("job-bg-cancel") is True
+                assert run_stopped.wait(timeout=5.0)
+                for _ in range(100):
+                    if not cancel_cron_run("job-bg-cancel"):
+                        break
+                    time.sleep(0.01)
+                assert cancel_cron_run("job-bg-cancel") is False
+
     def test_dispatches_and_returns_handle_immediately(self):
         """With a routable session, run claims sync then dispatches async."""
         run_started = threading.Event()
@@ -72,6 +112,7 @@ class TestBackgroundDispatch:
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
                 res = _try_dispatch_background_run(_job('job-bg-01'))
+                assert run_started.wait(timeout=5.0), "job never started in background"
 
         try:
             # Returned BEFORE the job finished — that's the whole point.
@@ -80,8 +121,6 @@ class TestBackgroundDispatch:
             assert res["dispatched"] is True
             assert res["delegation_id"]
             m_claim.assert_called_once_with("job-bg-01", return_job=True)
-            # The job actually starts on the daemon executor.
-            assert run_started.wait(timeout=5.0), "job never started in background"
         finally:
             run_release.set()
 
@@ -182,8 +221,13 @@ class TestSyncFallbacks:
 
     def test_pool_at_capacity_runs_inline(self):
         """A rejected dispatch must not strand the already-taken claim."""
+        claimed = {
+            **_job('job-bg-07'),
+            "fire_claim": {"by": "bg-owner"},
+            "execution_id": "exec-bg-07",
+        }
         with _bound_session_key():
-            with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: {**_job(jid), "fire_claim": {"by": "bg-owner"}}), \
+            with patch("tools.cronjob_tools.claim_job_for_fire", return_value=claimed), \
                  patch("tools.async_delegation.dispatch_async_delegation",
                        return_value={"status": "rejected", "error": "capacity"}), \
                  patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
@@ -192,7 +236,13 @@ class TestSyncFallbacks:
                 res = _try_dispatch_background_run(_job('job-bg-07'))
         assert res["dispatched"] is False
         assert res["success"] is True
-        m_run.assert_called_once()   # ran inline on this thread
+        m_run.assert_called_once()
+        args, kwargs = m_run.call_args
+        assert args == (claimed,)
+        assert kwargs["adapters"] is None
+        assert kwargs["loop"] is None
+        assert kwargs["extra_prompt"] is None
+        assert isinstance(kwargs["cancel_event"], threading.Event)
 
 
 class TestInFlightDedupe:
@@ -226,6 +276,10 @@ class TestInFlightDedupe:
 
         def probe_run(job, **kw):
             seen_during_run["registered"] = "job-bg-09" in sched.get_running_job_ids()
+            handle = sched._running_futures["job-bg-09"]
+            seen_during_run["live_thread_handle"] = (
+                handle is not sched._FUTURE_PENDING and not handle.done()
+            )
             return True
 
         with patch("cron.scheduler.run_one_job", side_effect=probe_run), \
@@ -235,6 +289,7 @@ class TestInFlightDedupe:
 
         assert res["success"] is True
         assert seen_during_run["registered"] is True
+        assert seen_during_run["live_thread_handle"] is True
         assert "job-bg-09" not in sched.get_running_job_ids()   # released after
 
     def test_background_dispatch_reports_running_job_immediately(self):
@@ -254,6 +309,23 @@ class TestInFlightDedupe:
             m_disp.assert_not_called()
         finally:
             sched.release_running_job("job-bg-10")
+
+    def test_background_dispatch_sweeps_stale_inflight_before_dedupe(self):
+        """Manual recovery must not wait for the next healthy scheduler tick."""
+        with _bound_session_key():
+            with patch(
+                "cron.scheduler.sweep_stale_inflight"
+            ) as sweep, patch(
+                "cron.scheduler.get_running_job_ids", return_value=frozenset()
+            ), patch(
+                "tools.cronjob_tools.claim_job_for_fire", return_value=False
+            ) as claim, patch(
+                "tools.cronjob_tools.get_job", return_value={**_JOB, "enabled": True}
+            ):
+                _try_dispatch_background_run(_job("job-bg-sweep"))
+
+        sweep.assert_called_once()
+        claim.assert_called_once_with("job-bg-sweep", return_job=True)
 
     def test_ticker_guard_uses_shared_helpers(self):
         """The ticker's _submit_with_guard and manual runs share ONE dedupe

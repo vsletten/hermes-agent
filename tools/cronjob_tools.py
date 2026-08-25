@@ -33,6 +33,8 @@ _CRON_RUN_HEARTBEAT_INTERVAL = 10.0
 # ~1800s. After this ceiling the heartbeat stops and the gateway watchdog
 # regains authority over the turn.
 _CRON_RUN_HEARTBEAT_CEILING = 6 * 3600.0
+_active_cron_runs_lock = threading.Lock()
+_active_cron_run_cancellations: Dict[str, threading.Event] = {}
 
 # Import from cron module (will be available when properly installed)
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -705,6 +707,15 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    execution = job.get("latest_execution")
+    if isinstance(execution, dict):
+        result["execution"] = {
+            key: execution.get(key)
+            for key in (
+                "id", "source", "status", "claimed_at", "started_at",
+                "finished_at", "error",
+            )
+        }
     stored_refs = job.get("context_from") or []
     if isinstance(stored_refs, str):
         stored_refs = [stored_refs]
@@ -767,7 +778,8 @@ def _execute_job_now(
 
 
 def _run_claimed_job(
-    job: Dict[str, Any], extra_prompt: Optional[str] = None
+    job: Dict[str, Any], extra_prompt: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     """Fire an already-claimed job through the shared ``run_one_job`` body.
 
@@ -805,6 +817,13 @@ def _run_claimed_job(
                 ),
             }
         _registered = True
+        # Direct/manual runs execute on this async-delegation thread rather
+        # than a scheduler-pool Future. Publish real thread liveness so the
+        # stale sweep cannot evict a healthy manual run merely because another
+        # attempted fire wrote a later terminal execution row.
+        from cron.scheduler import attach_running_job_to_current_thread
+
+        attach_running_job_to_current_thread(job_id)
 
         claim = job.get("fire_claim")
         fire_owner = str(claim.get("by") or "") if isinstance(claim, dict) else None
@@ -887,10 +906,14 @@ def _run_claimed_job(
 
         try:
             try:
-                processed = run_one_job(
-                    job, adapters=adapters, loop=gateway_loop,
-                    extra_prompt=extra_prompt,
-                )
+                run_kwargs = {
+                    "adapters": adapters,
+                    "loop": gateway_loop,
+                    "extra_prompt": extra_prompt,
+                }
+                if cancel_event is not None:
+                    run_kwargs["cancel_event"] = cancel_event
+                processed = run_one_job(job, **run_kwargs)
             finally:
                 _heartbeat_stop.set()
                 if _heartbeat_thread is not None:
@@ -1039,6 +1062,17 @@ def _try_dispatch_background_run(
         # but stay diagnosable (mirrors the scheduler tick's reap handling).
         logger.debug("Stale execution reclaim failed: %s", _reap_exc)
 
+    # Reconcile same-process in-memory claims too. A previous manual run can
+    # leave the shared running guard stale even though its durable execution is
+    # terminal; waiting for a healthy scheduler tick makes manual recovery
+    # impossible precisely when the ticker is wedged.
+    try:
+        from cron.scheduler import sweep_stale_inflight
+
+        sweep_stale_inflight([job])
+    except Exception as _sweep_exc:
+        logger.debug("In-flight cron reclaim failed: %s", _sweep_exc)
+
     # ---- routing capture (on THIS thread; contextvars don't cross the pool) ----
     # Resolved BEFORE the claim: with no routable session there is no durable
     # consumer for a detached completion, so we must not claim-and-dispatch.
@@ -1134,35 +1168,50 @@ def _try_dispatch_background_run(
 
     started_at = time.time()
     deliver = job.get("deliver", "local")
+    cancel_event = threading.Event()
+    with _active_cron_runs_lock:
+        _active_cron_run_cancellations[job_id] = cancel_event
+
+    def _clear_cancel_registration() -> None:
+        with _active_cron_runs_lock:
+            if _active_cron_run_cancellations.get(job_id) is cancel_event:
+                _active_cron_run_cancellations.pop(job_id, None)
 
     def _runner() -> Dict[str, Any]:
-        res = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
-        duration = round(time.time() - started_at, 2)
-        refreshed = get_job(job_id) or {}
-        lines = [
-            f"Cron job '{job_name}' ({job_id}) finished its manual run.",
-            f"Result: {'ok' if res.get('success') else 'FAILED'}"
-            + (f" — {res.get('error')}" if res.get("error") else ""),
-            f"Delivery target: {deliver}"
-            + (
-                " (output was delivered there by the job itself)"
-                if deliver != "local"
-                else " (output saved locally only)"
-            ),
-        ]
-        if refreshed.get("next_run_at"):
-            lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-        excerpt = _latest_job_output_excerpt(job_id)
-        if excerpt:
-            lines.append("--- JOB OUTPUT ---")
-            lines.append(excerpt)
-        return {
-            "status": "completed" if res.get("success") else "error",
-            "summary": "\n".join(lines),
-            "error": res.get("error"),
-            "api_calls": 0,
-            "duration_seconds": duration,
-        }
+        try:
+            res = _run_claimed_job(
+                claimed_job,
+                extra_prompt=extra_prompt,
+                cancel_event=cancel_event,
+            )
+            duration = round(time.time() - started_at, 2)
+            refreshed = get_job(job_id) or {}
+            lines = [
+                f"Cron job '{job_name}' ({job_id}) finished its manual run.",
+                f"Result: {'ok' if res.get('success') else 'FAILED'}"
+                + (f" — {res.get('error')}" if res.get("error") else ""),
+                f"Delivery target: {deliver}"
+                + (
+                    " (output was delivered there by the job itself)"
+                    if deliver != "local"
+                    else " (output saved locally only)"
+                ),
+            ]
+            if refreshed.get("next_run_at"):
+                lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
+            excerpt = _latest_job_output_excerpt(job_id)
+            if excerpt:
+                lines.append("--- JOB OUTPUT ---")
+                lines.append(excerpt)
+            return {
+                "status": "completed" if res.get("success") else "error",
+                "summary": "\n".join(lines),
+                "error": res.get("error"),
+                "api_calls": 0,
+                "duration_seconds": duration,
+            }
+        finally:
+            _clear_cancel_registration()
 
     dispatch = dispatch_async_delegation(
         goal=f"Manual run of cron job '{job_name}' ({job_id})",
@@ -1176,6 +1225,7 @@ def _try_dispatch_background_run(
         session_key=session_key,
         parent_session_id=str(session_id) if session_id else None,
         runner=_runner,
+        interrupt_fn=cancel_event.set,
         origin_ui_session_id=origin_ui_session_id,
         origin_session_id=origin_session_id,
         max_async_children=max_async,
@@ -1194,9 +1244,26 @@ def _try_dispatch_background_run(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name,
     )
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    try:
+        result = _run_claimed_job(
+            claimed_job,
+            extra_prompt=extra_prompt,
+            cancel_event=cancel_event,
+        )
+    finally:
+        _clear_cancel_registration()
     result["dispatched"] = False
     return result
+
+
+def cancel_cron_run(job_id: str) -> bool:
+    """Cooperatively interrupt an active background manual run by job id."""
+    with _active_cron_runs_lock:
+        cancel_event = _active_cron_run_cancellations.get(str(job_id))
+    if cancel_event is None:
+        return False
+    cancel_event.set()
+    return True
 
 
 def _apply_continuity(
@@ -1386,7 +1453,8 @@ def cronjob(
             )
 
         if normalized == "list":
-            jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
+            raw_jobs = list_jobs(include_disabled=include_disabled)
+            jobs = [_format_job(job) for job in raw_jobs]
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
 
         if not job_id:
@@ -1417,9 +1485,26 @@ def cronjob(
                 indent=2,
             )
         # Resolve to canonical ID (supports name-based lookup)
-        job_id = job["id"]
+        job_id = str(job["id"])
+
+        if normalized == "cancel":
+            requested = cancel_cron_run(job_id)
+            return json.dumps(
+                {
+                    "success": requested,
+                    "job_id": job_id,
+                    "cancellation_requested": requested,
+                    "message": (
+                        f"Cancellation requested for active manual run of '{job['name']}'."
+                        if requested
+                        else f"No active cancellable manual run exists for '{job['name']}'."
+                    ),
+                },
+                indent=2,
+            )
 
         if normalized == "remove":
+            cancellation_requested = cancel_cron_run(job_id)
             removed = remove_job(job_id)
             if not removed:
                 return tool_error(f"Failed to remove job '{job_id}'", success=False)
@@ -1433,6 +1518,7 @@ def cronjob(
                         "name": job["name"],
                         "schedule": job.get("schedule_display"),
                     },
+                    "cancellation_requested": cancellation_requested,
                 },
                 indent=2,
             )
@@ -1683,11 +1769,12 @@ CRONJOB_SCHEMA = {
 
 Use action='create' to schedule a new job from a prompt or one or more skills.
 Use action='list' to inspect jobs.
-Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
+Use action='update', 'pause', 'resume', 'remove', 'cancel', or 'run' to manage an existing job.
 
 action='run' fires the job immediately in the BACKGROUND (like delegate_task): the call returns at once with a handle and the job's outcome re-enters the conversation as a new message when it finishes. Do not wait or poll after triggering a run — just continue. Optionally pass 'prompt' with action='run' to inject transient per-run context (appended to the job's stored prompt for that single fire only, never persisted).
 
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
+Use action='cancel' to cooperatively stop an in-flight manual/background run without removing its schedule.
 
 Jobs run in a fresh session with no current-chat context, so prompts must be self-contained.
 If skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
@@ -1703,11 +1790,11 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
         "properties": {
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, cancel, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
             },
             "job_id": {
                 "type": "string",
-                "description": "Required for update/pause/resume/remove/run"
+                "description": "Required for update/pause/resume/remove/cancel/run"
             },
             "prompt": {
                 "type": "string",
@@ -1715,7 +1802,7 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
             },
             "schedule": {
                 "type": "string",
-                "description": "REQUIRED for action=create. For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp. Examples: '30m' (every 30 minutes), 'every 2h' (every 2 hours), '0 9 * * *' (daily at 9am), '2026-06-01T09:00:00' (one-shot). You MUST include this field when action=create."
+                "description": "REQUIRED for action=create. For create/update: '30m', 'every 30m', '0 9 * * *', or ISO timestamp. Examples: '30m' (one-shot in 30 minutes), 'every 30m' (recurring every 30 minutes), 'every 2h' (recurring every 2 hours), '0 9 * * *' (recurring daily at 9am), '2026-06-01T09:00:00' (one-shot at that time). Use the explicit 'every ' prefix for recurring interval jobs. You MUST include this field when action=create."
             },
             "name": {
                 "type": "string",

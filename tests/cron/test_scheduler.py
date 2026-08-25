@@ -626,6 +626,27 @@ class TestRunJobSessionPersistence:
             mock_agent_cls = entered[-1]  # the AIAgent patch
             yield fake_db, mock_agent_cls
 
+    def test_max_iteration_fallback_is_an_incomplete_failed_run(self, tmp_path):
+        """A narrative fallback must not turn exhausted work into cron success."""
+        job = {
+            "id": "max-turn-job",
+            "name": "max turn job",
+            "prompt": "finish the task",
+        }
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            mock_agent_cls.return_value.run_conversation.return_value = {
+                "completed": False,
+                "failed": False,
+                "final_response": "INCOMPLETE: implementation remains uncommitted",
+                "turn_exit_reason": "max_iterations_reached(90)",
+            }
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert "iteration limit" in (error or "").lower()
+        assert final_response == "INCOMPLETE: implementation remains uncommitted"
+        assert "INCOMPLETE" in output
+
 
     def test_run_job_memory_enabled_in_cron(self, tmp_path):
         """Cron agents get memory like any other agent run.

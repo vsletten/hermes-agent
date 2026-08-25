@@ -107,6 +107,24 @@ def test_cron_runs_cli_prints_execution_history(monkeypatch, tmp_path, capsys):
     assert "boom" in output
 
 
+def test_current_execution_prefers_live_owner_over_later_failed_duplicate(
+    monkeypatch, tmp_path
+):
+    """Status surfaces must not hide a live run behind a later lost fire."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    live = executions.create_execution("same-job", source="direct")
+    executions.mark_execution_running(live["id"])
+    duplicate = executions.create_execution("same-job", source="builtin")
+    executions.finish_execution(
+        duplicate["id"], success=False, error="Fire claim lost"
+    )
+
+    current = executions.current_executions(["same-job"])["same-job"]
+
+    assert current["id"] == live["id"]
+    assert current["status"] == "running"
+
+
 def test_quick_backup_includes_execution_ledger():
     from hermes_cli.backup import _QUICK_STATE_FILES
 
