@@ -152,11 +152,12 @@ class TestTickWorkdirPartition:
         jobs = [
             {"id": "a", "name": "A", "workdir": str(workdir_a)},
             {"id": "b", "name": "B", "workdir": str(workdir_b)},
+            {"id": "script", "name": "Script", "workdir": str(workdir_a), "no_agent": True, "script": "poll.py"},
         ]
         monkeypatch.setattr(sched, "get_due_jobs", lambda: jobs)
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
 
-        barrier = threading.Barrier(2, timeout=5)
+        barrier = threading.Barrier(3, timeout=5)
         calls: list[tuple[str, str]] = []
         calls_lock = threading.Lock()
 
@@ -171,8 +172,8 @@ class TestTickWorkdirPartition:
         monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
         monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
 
-        assert sched.tick(verbose=False, sync=True) == 2
-        assert {job_id for job_id, _thread in calls} == {"a", "b"}
+        assert sched.tick(verbose=False, sync=True) == 3
+        assert {job_id for job_id, _thread in calls} == {"a", "b", "script"}
         assert all(thread.startswith("cron-parallel") for _job, thread in calls)
 
 
