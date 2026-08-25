@@ -125,6 +125,22 @@ def test_current_execution_prefers_live_owner_over_later_failed_duplicate(
     assert current["status"] == "running"
 
 
+def test_current_execution_ignores_older_never_started_claim(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    stale_claim = executions.create_execution("same-job", source="builtin")
+    completed = executions.create_execution("same-job", source="builtin")
+    executions.mark_execution_running(completed["id"])
+    executions.finish_execution(completed["id"], success=True)
+
+    current = executions.current_executions(["same-job"])["same-job"]
+
+    assert current["id"] == completed["id"]
+    assert current["status"] == "completed"
+    assert current["id"] != stale_claim["id"]
+
+
 def test_quick_backup_includes_execution_ledger():
     from hermes_cli.backup import _QUICK_STATE_FILES
 

@@ -290,8 +290,10 @@ def current_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
     A duplicate scheduler fire can fail after a long direct/manual run has
     already started. Pure newest-first ordering then hides the real live owner
     behind the later failed duplicate, causing status consumers to report that
-    no work is running. Non-terminal ownership is authoritative until recovery
-    marks it terminal.
+    no work is running. A started ``running`` owner is authoritative until
+    recovery marks it terminal. A merely ``claimed`` row is ordered normally:
+    if a later attempt reached a terminal state, the older never-started claim
+    is stale bookkeeping rather than current work.
     """
     clean = [str(job_id) for job_id in dict.fromkeys(job_ids) if job_id]
     if not clean:
@@ -304,7 +306,7 @@ def current_executions(job_ids: List[str]) -> Dict[str, Dict[str, Any]]:
                   AND e.id=(SELECT e2.id FROM executions e2
                             WHERE e2.job_id=e.job_id
                             ORDER BY
-                              CASE WHEN e2.status IN ('claimed','running')
+                              CASE WHEN e2.status='running'
                                    THEN 0 ELSE 1 END,
                               e2.claimed_at DESC, e2.id DESC
                             LIMIT 1)""",
