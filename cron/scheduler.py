@@ -7463,14 +7463,24 @@ def tick(
                 verbose=verbose,
             )
 
-        # Partition due jobs: those with a per-job workdir mutate
+        # Partition due jobs. Agent jobs with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
-        # run_job's _terminal_cwd_lock is what additionally stops a concurrently
-        # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        # they queue on the single-thread sequential pool. Pure no_agent scripts
+        # return before that agent path and pass workdir as subprocess ``cwd``;
+        # routing those scripts through the sequential pool needlessly lets one
+        # long agent job starve minute-level intake/watchdog scripts.
+        # run_job's _terminal_cwd_lock additionally stops a workdir-less agent
+        # job from observing an active agent writer's override.
+        sequential_jobs = [
+            j
+            for j in due_jobs
+            if (j.get("workdir") or "").strip() and not j.get("no_agent")
+        ]
+        parallel_jobs = [
+            j
+            for j in due_jobs
+            if not ((j.get("workdir") or "").strip() and not j.get("no_agent"))
+        ]
 
         _results: list = []
         _all_futures: list = []
