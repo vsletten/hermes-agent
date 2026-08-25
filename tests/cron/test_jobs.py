@@ -395,6 +395,11 @@ class TestJobCRUD:
         job = create_job(prompt="One-shot", schedule="in 1h")
         assert job["repeat"]["times"] == 1
 
+    def test_repeated_one_shot_is_rejected_with_recurring_hint(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="recurring"):
+            create_job(prompt="watchdog", schedule="in 5m", repeat=131)
+        assert load_jobs() == []
+
     def test_repeat_string_forms_coerced(self, tmp_cron_dir):
         """Agents pass 'forever'/'once' as repeat — must coerce, not TypeError.
 

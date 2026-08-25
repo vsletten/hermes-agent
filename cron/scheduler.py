@@ -525,6 +525,15 @@ _running_futures: dict = {}
 # never sees ``missing`` and releases a claim about to get its future.
 _FUTURE_PENDING = object()
 
+class _ThreadRunHandle:
+    """Future-shaped liveness handle for direct/manual cron runner threads."""
+
+    def __init__(self, thread: threading.Thread) -> None:
+        self._thread = thread
+
+    def done(self) -> bool:
+        return not self._thread.is_alive()
+
 # Forced-release count/history for ``get_inflight_guard_stats()``; mirrored to JSONL for probes.
 _forced_release_count: int = 0
 _forced_releases: list = []
@@ -611,6 +620,21 @@ def release_running_job(job_id: str) -> None:
         _running_job_ids.discard(job_id)
         _running_since.pop(job_id, None)
         _running_futures.pop(job_id, None)
+
+
+def attach_running_job_to_current_thread(job_id: str) -> None:
+    """Replace the pre-submit sentinel with the live manual runner thread.
+
+    ``try_register_running_job`` is shared by scheduler-pool dispatch and
+    direct ``cronjob(action='run')`` dispatch. The latter does not own a
+    scheduler Future, so leaving ``_FUTURE_PENDING`` installed makes the stale
+    sweep treat a healthy manual run as a hung submit path. A thread-backed
+    handle gives the sweep the same ``done()`` contract as a real Future.
+    """
+    with _running_lock:
+        if job_id not in _running_job_ids:
+            raise RuntimeError(f"cron job {job_id!r} is not registered as running")
+        _running_futures[job_id] = _ThreadRunHandle(threading.current_thread())
 
 
 def _inflight_min_allowance_minutes() -> float:
@@ -730,7 +754,7 @@ def _latest_executions_for_releasable_claims() -> dict:
     if not candidates:
         return {}
     try:
-        from cron.executions import latest_executions as _latest_execs
+        from cron.executions import current_executions as _latest_execs
         return _latest_execs(candidates)
     except Exception:
         return {}
@@ -1868,8 +1892,8 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
         raise RuntimeError(result.get("error") or final_response_text or "agent reported failure")
     if max_iteration_summary:
         logger.warning(
-            "Job '%s' reached the iteration limit but produced a final fallback response; "
-            "delivering the response instead of failing the cron run",
+            "Job '%s' reached the iteration limit and is incomplete; "
+            "preserving the fallback response while failing the cron run",
             job_name)
 
     final_response = result.get("final_response", "") or ""
@@ -2360,12 +2384,25 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+        incomplete = (
+            result.get("completed") is False
+            and str(result.get("turn_exit_reason") or "").startswith("max_iterations_reached(")
+        )
+        error = (
+            "Agent reached the configured iteration limit before completing "
+            f"the cron task ({result.get('turn_exit_reason')})."
+            if incomplete else None
+        )
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
-        output = _run_doc_header(job, job_name, job_id, prompt) + f"## Response\n\n{logged_response}\n"
-        logger.info("Job '%s' completed successfully", job_name)
-        _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), None)
-        return True, output, final_response, None
+        output = _run_doc_header(job, f"{job_name} (INCOMPLETE)" if incomplete else job_name, job_id, prompt)
+        output += f"## Response\n\n{logged_response}\n"
+        if incomplete:
+            logger.error("Job '%s' stopped incomplete at the iteration limit", job_name)
+        else:
+            logger.info("Job '%s' completed successfully", job_name)
+        _audit.write(dict(result, response_silent=_is_cron_silence_response(final_response or "")), error)
+        return not incomplete, output, final_response, error
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"

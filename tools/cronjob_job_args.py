@@ -375,6 +375,12 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     for key in _FORMAT_JOB_OPTIONAL_KEYS:
         if job.get(key):
             result[key] = True if key == "no_agent" else job[key]
+    execution = job.get("latest_execution")
+    if isinstance(execution, dict):
+        result["execution"] = {
+            key: execution.get(key)
+            for key in ("id", "source", "status", "claimed_at", "started_at", "finished_at", "error")
+        }
     stored_refs = job.get("context_from") or []
     if isinstance(stored_refs, str):
         stored_refs = [stored_refs]

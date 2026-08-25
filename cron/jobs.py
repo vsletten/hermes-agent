@@ -1719,6 +1719,11 @@ def create_job(
     repeat = normalize_repeat_value(repeat)
     if parsed_schedule["kind"] == "once" and repeat is None:
         repeat = 1
+    elif parsed_schedule["kind"] == "once" and repeat != 1:
+        raise ValueError(
+            f"One-shot schedule {schedule!r} cannot repeat {repeat} times. "
+            "Use 'every 5m' or another recurring schedule instead."
+        )
     if deliver is None:
         deliver = "origin" if origin else "local"
     job_id = uuid.uuid4().hex[:12]
@@ -1844,9 +1849,9 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     if not include_disabled:
         jobs = [j for j in jobs if j.get("enabled", True)]
     try:
-        from cron.executions import latest_executions
+        from cron.executions import current_executions
 
-        latest = latest_executions([job.get("id", "") for job in jobs])
+        latest = current_executions([job.get("id", "") for job in jobs])
     except Exception:
         latest = {}
     for job in jobs:

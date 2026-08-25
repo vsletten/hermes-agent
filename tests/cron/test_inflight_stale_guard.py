@@ -262,6 +262,36 @@ class TestStaleInflightSweep:
              patch.object(sched, "_get_hermes_home", return_value=tmp_path):
             assert sched.sweep_stale_inflight([job]) == [job["id"]]
 
+    def test_live_manual_run_thread_is_not_released_by_later_terminal_attempt(
+        self, tmp_path
+    ):
+        """A failed duplicate fire must not evict an active manual cron run.
+
+        Manual runs execute on an async-delegation thread, not the scheduler
+        pool.  Their in-flight row used to stay ``_FUTURE_PENDING`` forever,
+        so a later failed scheduler fire became the job's latest terminal
+        ledger row and falsely released the still-running manual owner.
+        """
+        job = _job(job_id="manual-live", minutes=30)
+        job_id = job["id"]
+        assert sched.try_register_running_job(job_id)
+        sched.attach_running_job_to_current_thread(job_id)
+        sched._running_since[job_id] = time.time() - 20 * 60
+
+        with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
+             patch("cron.executions.current_executions", return_value={
+                 job_id: {
+                     "status": "failed",
+                     "id": "later-duplicate-fire",
+                     "claimed_at": datetime.now(timezone.utc).isoformat(),
+                 }
+             }), \
+             patch.object(sched, "mark_job_run") as mark:
+            assert sched.sweep_stale_inflight([job]) == []
+
+        assert job_id in sched.get_running_job_ids()
+        mark.assert_not_called()
+
     def test_pending_sentinel_released_when_submit_hung(self, tmp_path):
         """A claim whose submit path hung stays _FUTURE_PENDING past its
         allowance (the SessionDB-init wedge class) and must be released."""
@@ -401,7 +431,7 @@ class TestLedgerTerminalReconciliation:
         self._inject_young_claim(job_id)
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={
+             patch("cron.executions.current_executions", return_value={
                  job_id: {"status": "failed", "id": "exec-x",
                           "claimed_at": self._row_at(-30)},  # after claim (-60)
              }), \
@@ -426,7 +456,7 @@ class TestLedgerTerminalReconciliation:
         self._inject_young_claim(job_id)
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={
+             patch("cron.executions.current_executions", return_value={
                  job_id: {"status": "completed", "id": "exec-prev",
                           "claimed_at": self._row_at(-600)},  # before claim (-60)
              }), \
@@ -447,7 +477,7 @@ class TestLedgerTerminalReconciliation:
         self._inject_young_claim(job_id)
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={
+             patch("cron.executions.current_executions", return_value={
                  job_id: {"status": "failed", "id": "exec-x"},
              }), \
              patch.object(sched, "mark_job_run"):
@@ -465,7 +495,7 @@ class TestLedgerTerminalReconciliation:
         self._inject_young_claim(job_id)
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={}), \
+             patch("cron.executions.current_executions", return_value={}), \
              patch.object(sched, "mark_job_run"):
             released = sched.sweep_stale_inflight([job])
 
@@ -481,7 +511,7 @@ class TestLedgerTerminalReconciliation:
         self._inject_young_claim(job_id)
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={
+             patch("cron.executions.current_executions", return_value={
                  job_id: {"status": "running", "id": "exec-y"},
              }), \
              patch.object(sched, "mark_job_run"):
@@ -500,7 +530,7 @@ class TestLedgerTerminalReconciliation:
             sched._running_since[job_id] = time.time() - 6 * 60 * 60  # 6h old
 
         with patch.object(sched, "_get_hermes_home", return_value=tmp_path), \
-             patch("cron.executions.latest_executions", return_value={
+             patch("cron.executions.current_executions", return_value={
                  job_id: {"status": "completed", "id": "exec-z",
                           "claimed_at": self._row_at(-3 * 60 * 60)},  # after claim (-6h)
              }), \
