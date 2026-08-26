@@ -396,7 +396,7 @@ def setup_model_provider(config: dict, *, quick: bool = False):
 
 def _apply_default_agent_settings(config: dict):
     """Apply recommended defaults for all agent settings without prompting."""
-    config.setdefault("agent", {})["max_turns"] = 150
+    config.setdefault("agent", {})["max_turns"] = 9000
     # config.yaml is authoritative for max_turns (the gateway bridges it into HERMES_MAX_ITERATIONS);
     # a stale .env entry silently shadowing it caused the 60-vs-500 bug, so drop it.
     remove_env_value("HERMES_MAX_ITERATIONS")
@@ -407,7 +407,7 @@ def _apply_default_agent_settings(config: dict):
     config.setdefault("session_reset", {})["mode"] = "none"
     save_config(config)
     print_success("Applied recommended defaults:")
-    _info("  Max iterations: 150", "  Tool progress: all", "  Compression threshold: 0.50",
+    _info("  Max iterations: 9000", "  Tool progress: all", "  Compression threshold: 0.50",
           "  Session reset: never (use /reset or compression)",
           "  Run `hermes setup agent` later to customize.")
 
@@ -461,10 +461,10 @@ def setup_agent_settings(config: dict):
     # ── Max Iterations ── (config.yaml is authoritative; never surface a stale legacy .env value)
     # If a legacy .env entry is still around (from pre-PR#18413 setups), prefer the config value so we don't
     # surface a stale number to the user.
-    current_max = str(cfg_get(config, "agent", "max_turns", default=90))
+    current_max = str(cfg_get(config, "agent", "max_turns", default=9000))
     _info("Maximum tool-calling iterations per conversation.",
           "Higher = more complex tasks, but costs more tokens.",
-          f"Press Enter to keep {current_max}. Use 90 for most tasks or 150+ for open exploration.")
+          f"Press Enter to keep {current_max}. Autonomous worker profiles should use 9000.")
     max_iter = _prompt_number("Max iterations", current_max)
     if max_iter is None:
         print_warning("Invalid number, keeping current value")
