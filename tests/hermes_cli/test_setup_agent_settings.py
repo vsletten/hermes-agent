@@ -1,6 +1,15 @@
 """Tests for agent-settings copy in the interactive setup wizard."""
 
-from hermes_cli.setup import setup_agent_settings
+from hermes_cli.setup import _apply_default_agent_settings, setup_agent_settings
+
+
+def test_noninteractive_setup_preserves_production_worker_turn_budget(monkeypatch):
+    monkeypatch.setattr("hermes_cli.setup.remove_env_value", lambda *args, **kwargs: None)
+    config = {}
+
+    _apply_default_agent_settings(config)
+
+    assert config["agent"]["max_turns"] == 9000
 
 
 def test_setup_agent_settings_uses_displayed_max_iterations_value(tmp_path, monkeypatch, capsys):
