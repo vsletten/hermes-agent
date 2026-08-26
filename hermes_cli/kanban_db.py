@@ -2539,9 +2539,9 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
+    """``todo|running|ready|blocked|review -> done``; records ``result``.
 
-    ``ready`` is accepted for manual CLI completion, ``review`` for human
+    Parent-satisfied ``todo`` and ``ready`` tasks allow manual CLI completion, ``review`` for human
     approval; with no active run the handoff fields survive via
     :func:`_synthesize_ended_run`. ``summary`` (defaults to ``result``) and
     ``metadata`` land on the closing run for :func:`build_worker_context`.
@@ -2575,7 +2575,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('todo', 'running', 'ready', 'blocked', 'review')
                 """
         params: tuple = (result, now, task_id)
         if expected_run_id is not None:
