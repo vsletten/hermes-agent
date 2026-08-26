@@ -5360,9 +5360,9 @@ def complete_task(
     expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
 ) -> bool:
-    """Transition ``running|ready|blocked|review -> done`` and record ``result``.
+    """Transition ``todo|running|ready|blocked|review -> done`` and record ``result``.
 
-    Accepts a task that is merely ``ready`` too, so a manual CLI
+    Accepts a parent-satisfied task parked in ``todo`` or ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
     a claim/start/complete sequence. ``review`` is accepted so a human
     (or reviewer) can approve a task parked in the review lane by
@@ -5452,7 +5452,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('todo', 'running', 'ready', 'blocked', 'review')
                 """,
                 (result, now, task_id),
             )
@@ -5469,7 +5469,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('todo', 'running', 'ready', 'blocked', 'review')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -5494,7 +5494,7 @@ def complete_task(
             summary=summary if summary is not None else result,
             metadata=metadata,
         )
-        # If complete_task was called on a never-claimed task (ready or
+        # If complete_task was called on a never-claimed task (todo, ready, or
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.

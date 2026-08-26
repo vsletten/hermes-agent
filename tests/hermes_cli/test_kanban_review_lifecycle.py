@@ -666,6 +666,29 @@ def test_review_cycle_end_to_end(kanban_home: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# never-claimed ready/todo tasks: terminal handoff must remain possible
+# ---------------------------------------------------------------------------
+
+
+def test_manual_completion_accepts_parent_satisfied_todo(kanban_home: Path) -> None:
+    """A stale orchestration receipt can be parked in ``todo`` without parents.
+
+    Deterministic reconcilers must be able to terminalize it without archiving
+    the shared workspace or spawning the obsolete task merely to complete it.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="stale todo receipt", assignee="worker")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'todo' WHERE id = ?", (tid,))
+
+        assert kb.complete_task(conn, tid, result="superseded") is True
+        row = kb.get_task(conn, tid)
+        assert row is not None
+        assert row.status == "done"
+        assert row.result == "superseded"
+
+
+# ---------------------------------------------------------------------------
 # never-claimed 'ready' task: handoff must survive via a synthesized run
 # ---------------------------------------------------------------------------
 
