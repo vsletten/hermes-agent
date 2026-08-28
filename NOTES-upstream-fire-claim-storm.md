@@ -112,3 +112,12 @@ Full cron suite: 1025 passed, 1 skipped.
 - Gateway processes import at start; a restart is required for the patch (and
   was required anyway — the 2026-08-23 incident gateway, PIDs 3335/3336
   started 2026-08-22, was still running pre-08-27 code).
+- Live-verified 2026-08-27: the sibling ticker on the main cron store turned
+  out to be the **Hermes desktop app's backend** (`hermes_cli.main serve`,
+  child of the Electron app) — profile gateways use separate per-profile
+  stores. During verification the old-code desktop backend reproduced exactly
+  one "Fire claim lost" failed row against a patched-gateway in-flight run
+  (writer attributed via the ledger's `pid` column); after terminating it the
+  desktop auto-respawned it onto the patched tree. Activation therefore
+  means: restart `hermes-gateway.service` + `hermes-gateway-ivy.service`
+  (systemd user units) AND kill the desktop `serve` child (auto-respawns).
