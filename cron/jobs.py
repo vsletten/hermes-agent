@@ -2902,6 +2902,18 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         and _claim_is_live(job.get("run_claim"), now, run_claim_ttl)
     ):
         return False
+    # Cross-process fire-claim guard for RECURRING jobs (the recurring mirror of the one-shot
+    # run_claim guard above): a live, heartbeated ``fire_claim`` means a scheduler process already
+    # won this fire slot and its run is still in flight. Returning the job as due only dispatches
+    # a doomed claim-CAS attempt (one junk "Fire claim lost" ledger row per tick; 2026-08-23
+    # incident). Skip while the claim is fresh; the TTL stays the backstop for a dead claimant.
+    # A pending manual run is exempt so "run now" keeps its semantics (the CAS stays the arbiter).
+    if (
+        job.get("schedule", {}).get("kind") in {"cron", "interval"}
+        and job.get("manual_run_at") != job.get("next_run_at")
+        and _claim_is_live(job.get("fire_claim"), now, FIRE_CLAIM_TTL_SECONDS)
+    ):
+        return False
 
     next_run = job.get("next_run_at") or _recover_missing_next_run(job, scan)
     if not next_run:

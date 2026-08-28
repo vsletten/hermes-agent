@@ -484,7 +484,7 @@ from cron.jobs import (
     clear_run_claim, get_due_jobs, heartbeat_fire_claim, heartbeat_run_claim, mark_job_run,
     save_job_output, use_cron_store)
 from cron.executions import (
-    _TERMINAL_STATES, create_execution, finish_execution, get_execution,
+    _TERMINAL_STATES, create_execution, discard_execution, finish_execution, get_execution,
     mark_execution_handoff_pending, mark_execution_running, recover_interrupted_executions)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
@@ -3622,8 +3622,16 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     claimed = claim_job_for_fire(job["id"], return_job=True)
     if not claimed:
-        finish_execution(
-            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+        # Lost the store-level CAS to a live owner (a sibling scheduler process holds this fire
+        # slot / its run is still in flight). Nothing started and no side effects ran, so this is
+        # not a job failure: drop the never-started ledger row instead of durably closing a failed
+        # run per attempt (2026-08-23: one alarming row per ticker minute for a 2h in-flight run).
+        # If the row already left 'claimed' (dead-owner recovery raced us), close it honestly.
+        if not discard_execution(job["execution_id"]):
+            finish_execution(
+                job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+        logger.debug("Job '%s': fire claim lost — a live claim holds this fire slot; attempt skipped "
+            "(no execution started)", job.get("name", job.get("id")))
         return True
     # CAS returns the persisted record; bool fallback only for older test doubles.
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
