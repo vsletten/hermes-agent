@@ -200,6 +200,26 @@ def finish_execution(
     return record
 
 
+def discard_execution(execution_id: str) -> bool:
+    """Delete one never-started attempt (status ``claimed``) from the ledger.
+
+    Reserved for the fire-claim-lost dispatch path: the attempt lost the
+    store-level claim CAS to a live owner, so provably no execution and no
+    side effects ever started — there is nothing for recovery to classify
+    and nothing operators need in run history (the claim WINNER's own row
+    documents the fire). Durably closing these as ``failed`` turned one 2h
+    in-flight run into 122 alarming per-minute rows (2026-08-23 incident).
+    Attempts that reached ``running`` are never discarded; their only exits
+    are :func:`finish_execution` and dead-owner recovery.
+    """
+    with _transaction() as conn:
+        cur = conn.execute(
+            "DELETE FROM executions WHERE id=? AND status='claimed'",
+            (str(execution_id),),
+        )
+        return cur.rowcount == 1
+
+
 def recover_interrupted_executions() -> int:
     """Mark provably abandoned attempts unknown without scheduling retries."""
     now = _hermes_now().isoformat()

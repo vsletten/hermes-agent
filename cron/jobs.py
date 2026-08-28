@@ -984,7 +984,10 @@ def _job_is_stale_error_recurring(
         normal transient-error retry that will fire on its own soon, it is a
         job that has been sitting errored for a full period with no recovery;
       * it is not currently running in this process (a live run must never be
-        re-armed underneath itself, #62002-style).
+        re-armed underneath itself, #62002-style);
+      * no live ``fire_claim`` exists — a fresh, heartbeated claim means a
+        claimant (possibly in ANOTHER process) is actively running the job
+        right now, so the job is slow, not wedged.
 
     ``last_run_at`` being older than one cadence is the key discriminator: a
     job that errors and is retried on its normal schedule keeps ``last_run_at``
@@ -994,6 +997,13 @@ def _job_is_stale_error_recurring(
     if job.get("last_status") != "error":
         return False
     if _job_running_in_this_process(str(job.get("id") or "")):
+        return False
+    # The in-process check above cannot see a run owned by a sibling scheduler
+    # process; the durable claim can. Without this, a second gateway process
+    # re-armed next_run_at to now on EVERY tick for the whole duration of a
+    # long in-flight run — each re-arm dispatched a doomed claim attempt whose
+    # loss was durably logged once per minute (2026-08-23: 122 rows in 2h).
+    if _claim_is_live(job.get("fire_claim"), now, FIRE_CLAIM_TTL_SECONDS):
         return False
     last_run = job.get("last_run_at")
     if not last_run:
@@ -2489,6 +2499,16 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
+# Durable fire-claim TTL: how long an unrenewed ``fire_claim`` stays live.
+# The claim owner heartbeats it (~60s cadence, heartbeat_fire_claim) while
+# its run is in flight, so a healthy long run keeps the claim fresh for
+# hours; only a dead or hung claimant lets it lapse. Every site that judges
+# fire-claim liveness (due scan, stale-error recovery, one-shot re-arm, the
+# claim CAS itself) must use this SAME window — with mixed windows a claim
+# can be "stale enough to overwrite" yet "live enough to skip", or vice versa.
+FIRE_CLAIM_TTL_SECONDS = 300
+
+
 def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     if not isinstance(claim, dict) or not claim.get("at"):
         return False
@@ -2528,7 +2548,7 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[Dict[str, Any]]:
             now = _hermes_now()
             if _claim_is_live(job.get("run_claim"), now, _oneshot_run_claim_ttl_seconds()):
                 raise ValueError("Cannot re-arm one-shot over a live run claim.")
-            if _claim_is_live(job.get("fire_claim"), now, 300):
+            if _claim_is_live(job.get("fire_claim"), now, FIRE_CLAIM_TTL_SECONDS):
                 raise ValueError("Cannot re-arm one-shot over a live fire claim.")
             if job.get("schedule", {}).get("kind") != "once":
                 raise ValueError(
@@ -3142,7 +3162,7 @@ def _machine_id() -> str:
 def claim_job_for_fire(
     job_id: str,
     *,
-    claim_ttl_seconds: int = 300,
+    claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS,
     force: bool = False,
     return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
@@ -3160,7 +3180,7 @@ def claim_job_for_fire(
 def _claim_job_for_fire_locked(
     job_id: str,
     *,
-    claim_ttl_seconds: int = 300,
+    claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS,
     force: bool = False,
     return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
@@ -3546,6 +3566,31 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         continue  # a fresh claim is held by an in-flight run
                 except (KeyError, ValueError, TypeError):
                     pass  # malformed claim → fall through and (re)claim
+
+            # Cross-process fire-claim guard for RECURRING jobs (the recurring
+            # mirror of #59229 above): a live ``fire_claim`` means a scheduler
+            # process already won this job's current fire slot and its run is
+            # still in flight — the runner heartbeats the claim every ~60s
+            # (heartbeat_fire_claim), so a healthy multi-hour run keeps it
+            # fresh the whole time. Returning the job as due anyway only
+            # dispatches a doomed claim-CAS attempt, and worse, lets the
+            # stale-error recovery below re-arm next_run_at back to now every
+            # tick — the 2026-08-23 incident: one durable "Fire claim lost"
+            # row per ticker minute for the entire 2h run (122 rows). Skip
+            # the job while the claim is fresh; the fire slot is consumed.
+            # The claim TTL stays the backstop: a claimant that dies stops
+            # renewing, the claim goes stale within FIRE_CLAIM_TTL_SECONDS,
+            # and the job becomes due (and reclaimable) again. A pending
+            # manual run is exempt so "run now" keeps its current semantics
+            # (the claim CAS in claim_job_for_fire remains the arbiter).
+            if (
+                job.get("schedule", {}).get("kind") in {"cron", "interval"}
+                and job.get("manual_run_at") != job.get("next_run_at")
+                and _claim_is_live(
+                    job.get("fire_claim"), now, FIRE_CLAIM_TTL_SECONDS
+                )
+            ):
+                continue
 
             next_run = job.get("next_run_at")
             if not next_run:

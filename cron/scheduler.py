@@ -652,7 +652,12 @@ from cron.jobs import (
     save_job_output,
     use_cron_store,
 )
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    discard_execution,
+    finish_execution,
+    mark_execution_running,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -7890,10 +7895,25 @@ def tick(
             # This prevents a queued lease from expiring before execution.
             claimed = claim_job_for_fire(job["id"], return_job=True)
             if not claimed:
-                finish_execution(
-                    job["execution_id"],
-                    success=False,
-                    error="Fire claim lost; execution was not started.",
+                # Lost the store-level CAS — a live claim (typically a sibling
+                # scheduler process that won this fire slot, or its run still
+                # in flight) holds the job. Nothing started and no side effects
+                # ran, so this is not a job failure: drop the pre-dispatch
+                # ledger row and leave a debug line instead of durably logging
+                # a failed run per attempt (2026-08-23: one alarming row per
+                # ticker minute for a 2h in-flight run). If the row already
+                # left 'claimed' (dead-owner recovery raced us), close it
+                # honestly rather than leaking it.
+                if not discard_execution(job["execution_id"]):
+                    finish_execution(
+                        job["execution_id"],
+                        success=False,
+                        error="Fire claim lost; execution was not started.",
+                    )
+                logger.debug(
+                    "Job '%s': fire claim lost — a live claim holds this fire "
+                    "slot; attempt skipped (no execution started)",
+                    job.get("name", job.get("id")),
                 )
                 return True
             # Production CAS returns the exact persisted record with its unique
