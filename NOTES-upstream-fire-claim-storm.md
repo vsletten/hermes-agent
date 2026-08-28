@@ -112,6 +112,18 @@ Full cron suite: 1025 passed, 1 skipped.
 - Gateway processes import at start; a restart is required for the patch (and
   was required anyway — the 2026-08-23 incident gateway, PIDs 3335/3336
   started 2026-08-22, was still running pre-08-27 code).
+- **Verification note (2026-08-27):** after activation, ophir-queue-drain's
+  21:06 fire naturally ran 1h54m (21:06:36→23:00:16) — a live replay of the
+  incident scenario. Its fire claim was held and heartbeated the whole time
+  while three of its 30m slots lapsed and both patched tickers (gateway
+  2385926, desktop backend 2502575) kept ticking: **zero "Fire claim lost"
+  rows, zero failed rows** in the window (vs. 122 in the 2026-08-23
+  incident), the run durably visible as `running` throughout and finalized
+  `completed` on the same row, and victor-gates-notify completed normally at
+  21:33/22:03/22:33. A synthetic every-3m/250s-sleep job earlier showed the
+  same: clean cycles once all tickers ran patched code, and the ledger's
+  `unknown` dead-owner marking working when the old desktop backend was
+  terminated mid-claim.
 - Live-verified 2026-08-27: the sibling ticker on the main cron store turned
   out to be the **Hermes desktop app's backend** (`hermes_cli.main serve`,
   child of the Electron app) — profile gateways use separate per-profile
