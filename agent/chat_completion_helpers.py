@@ -1533,6 +1533,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
     else:
         _codex_idle_timeout_default = 12.0
 
+    # xAI Grok (and other non-Codex Responses backends) can sit silent for
+    # minutes after the opening SSE frame while reasoning — they do not emit
+    # Codex-style in_progress keepalives. The Codex idle buckets (12/60/120)
+    # then force-close a healthy stream; httpx surfaces that as EPIPE
+    # ("Broken pipe") and a 3-retry cron budget dies in ~3 minutes.
+    if _codex_watchdog_enabled and not _openai_codex_backend:
+        _codex_idle_timeout_default = max(_codex_idle_timeout_default, 300.0)
+
     # No-byte TTFB cutoff. The OpenAI SDK's own streaming read timeout is far
     # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a tight 12s default
     # killed subscription-backed Codex requests mid-prefill before the backend
