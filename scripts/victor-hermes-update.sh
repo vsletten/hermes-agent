@@ -144,6 +144,11 @@ if [[ "$current_branch" != "$BRANCH" ]]; then
 fi
 # No force fallback: any non-fast-forward rejection leaves the install untouched.
 run git -C "$TMP_WORKTREE" push --atomic "$ORIGIN_REMOTE" "${push_refs[@]}"
+# A scoped native updater fetch does not refresh origin/current when the
+# install's configured fetch refspec only tracks main. Populate it explicitly.
+run git -C "$REPO" fetch origin "refs/heads/$current_branch:refs/remotes/origin/$current_branch"
+[[ "$(git -C "$REPO" rev-parse "refs/remotes/origin/$current_branch")" == "$candidate" ]] ||
+  die 'Remote install branch moved after publication; refusing to install an unvalidated commit.'
 assert_install_unchanged
 (cd "$REPO" && run "$REPO/venv/bin/python" -m hermes_cli.main update --yes --branch "$current_branch")
 [[ "$(git -C "$REPO" symbolic-ref --quiet --short HEAD)" == "$current_branch" ]] || die 'Updater unexpectedly changed the install branch.'

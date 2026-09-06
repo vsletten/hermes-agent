@@ -98,6 +98,19 @@ class UpdaterTests(unittest.TestCase):
         self.assertFalse(self.logfile.exists())
         self.assertEqual(len(list((self.root / "candidates").iterdir())), 1)
 
+    def test_narrow_origin_fetch_refspec_updates_current_tracking_ref(self):
+        self.git("config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
+        self.git("push", "origin", "HEAD:refs/heads/wip/local-customizations")
+        self.git("update-ref", "refs/remotes/origin/wip/local-customizations", self.original)
+        result = self.update("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        candidate = self.git("rev-parse", "HEAD").strip()
+        self.assertNotEqual(candidate, self.original)
+        self.assertEqual(self.git("rev-parse", "origin/wip/local-customizations").strip(), candidate)
+        self.git("merge-base", "--is-ancestor", self.original, candidate)
+        self.git("merge-base", "--is-ancestor", self.upstream_head, candidate)
+        self.assertIn(candidate, self.git("ls-remote", "origin", "refs/heads/wip/local-customizations"))
+
     def test_failed_validation_never_publishes_candidate_or_installs(self):
         before = self.git("ls-remote", "origin", "refs/heads/main")
         self.env["HERMES_UPDATE_TEST_COMMAND"] = "exit 42"
