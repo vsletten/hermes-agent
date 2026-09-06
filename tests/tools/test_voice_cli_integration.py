@@ -46,7 +46,29 @@ def _make_voice_cli(**overrides):
 # Markdown stripping — import real function from tts_tool
 # ============================================================================
 
-from tools.tts_tool import _strip_markdown_for_tts
+@pytest.mark.parametrize("voice_config,expected", [({"enabled": True}, True), ({"enabled": False}, False), (None, False)])
+def test_run_enables_configured_voice_after_state_initialization(voice_config, expected):
+    from cli import HermesCLI
+
+    cli = _make_voice_cli(config={"voice": voice_config})
+    cli._claim_active_session = lambda _: True
+    cli._tui_print_startup = lambda: None
+    cli._tui_init_run_state = lambda: setattr(cli, "_voice_mode", False)
+    cli._enable_voice_mode = MagicMock(side_effect=lambda: setattr(cli, "_voice_mode", True))
+
+    class StartupComplete(Exception):
+        pass
+
+    def check_initialized_state():
+        assert cli._voice_mode is expected
+        assert cli._enable_voice_mode.call_count == int(expected)
+        raise StartupComplete
+
+    cli._tui_build_key_bindings = check_initialized_state
+    with pytest.raises(StartupComplete):
+        HermesCLI.run(cli)
+
+from tools.tts_text_normalize import _strip_markdown_for_tts
 
 
 class TestMarkdownStripping:
@@ -630,7 +652,7 @@ class TestTypedVoiceStop:
         # Hermetic: don't let a dev machine's voice.stop_phrases config
         # change which utterances count as a stop phrase.
         monkeypatch.setattr(
-            "tools.voice_mode._load_voice_stop_phrases", lambda: ("stop",)
+            "tools.voice_mode_transcript._load_voice_stop_phrases", lambda: ("stop",)
         )
 
     def test_typed_stop_ends_voice_chat_when_voice_on(self):
@@ -680,4 +702,3 @@ class TestFallbackSpeakArmsBargeMonitor:
         # speak thread came and went without arming the mic.
         assert not cli._monitor_armed.wait(0.05)
         assert cli._monitor_calls == []
-

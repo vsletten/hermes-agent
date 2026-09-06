@@ -16,8 +16,10 @@ real on-disk auth stores (profile + root under ``tmp_path``) rather than
 mocking the save boundary, so they exercise the actual atomic write path.
 """
 
+import base64
 import json
 import threading
+import time
 
 import pytest
 
@@ -26,8 +28,10 @@ from agent.credential_pool import (
     AUTH_TYPE_OAUTH,
     CredentialPool,
     PooledCredential,
+    load_pool,
 )
 from hermes_cli import auth as A
+import hermes_cli.auth_codex as auth_codex
 
 
 def _write_store(path, store):
@@ -66,6 +70,7 @@ def profile_and_root(tmp_path, monkeypatch):
 
     monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
     monkeypatch.setattr(A, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
     monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
     return profile_path, root_path
 
@@ -233,7 +238,6 @@ def test_profile_add_on_root_fallback_remains_profile_local(
     assert _read_store(root_path)["credential_pool"]["xai-oauth"] == [root_entry]
     profile_entries = _read_store(profile_path)["credential_pool"]["xai-oauth"]
     assert [entry["id"] for entry in profile_entries] == [
-        "xai-root-only",
         "xai-profile-new",
     ]
 
@@ -257,6 +261,33 @@ def test_profile_add_on_root_fallback_remains_profile_local(
     profile_entries = _read_store(profile_path)["credential_pool"]["xai-oauth"]
     profile_added = next(entry for entry in profile_entries if entry["id"] == "xai-profile-new")
     assert profile_added["refresh_token"] == "profile-rotated-refresh"
+
+
+def test_loaded_root_grant_keeps_owner_after_profile_gets_own_row(profile_and_root, monkeypatch):
+    """A new profile row cannot redirect an already-loaded root grant."""
+    profile_path, root_path = profile_and_root
+    root_entry = _entry("xai-oauth", id="root-row", access_token="root-access", refresh_token="root-refresh")
+    root_entry.source = "manual:device_code"
+    profile_entry = _entry("xai-oauth", id="profile-row", access_token="profile-access", refresh_token="profile-refresh")
+    profile_entry.source = "manual:device_code"
+    _write_store(profile_path, {"version": 1})
+    _write_store(root_path, {"version": 1, "credential_pool": {"xai-oauth": [root_entry.to_dict()]}})
+    pool = CP.load_pool("xai-oauth")
+    # Another process authenticates a profile account after this pool's read.
+    _write_store(profile_path, {"version": 1, "credential_pool": {"xai-oauth": [profile_entry.to_dict()]}})
+    profile_before = _read_store(profile_path)
+
+    def refresh(access_token, refresh_token, **kwargs):
+        assert (access_token, refresh_token) == ("root-access", "root-refresh")
+        assert getattr(A._auth_lock_holder_for(root_path), "depth", 0) > 0
+        assert getattr(A._auth_lock_holder_for(profile_path), "depth", 0) == 0
+        return {"access_token": "root-new-access", "refresh_token": "root-new-refresh"}
+
+    monkeypatch.setattr(A, "refresh_xai_oauth_pure", refresh)
+    refreshed = pool._refresh_entry(pool._entries[0], force=True)
+    assert refreshed.refresh_token == "root-new-refresh"
+    assert _read_store(root_path)["credential_pool"]["xai-oauth"][0]["refresh_token"] == "root-new-refresh"
+    assert _read_store(profile_path) == profile_before
 
 
 def test_root_fallback_runtime_status_does_not_create_profile_shadow(
@@ -355,20 +386,26 @@ def test_concurrent_profile_fallback_refreshes_spend_root_token_once(
 def test_profile_owned_xai_pool_refresh_stays_in_profile(profile_and_root, monkeypatch):
     """A profile-owned pool must keep shadowing root after token rotation."""
     profile_path, root_path = profile_and_root
+    # Distinct JWT identities distinguish independent grants from cloned rows
+    # for the upstream OAuth-fork healer.
+    profile_access, root_access = [
+        "e30." + base64.urlsafe_b64encode(json.dumps({"sub": account}).encode()).decode().rstrip("=") + ".sig"
+        for account in ("profile-account", "root-account")
+    ]
     profile_entry = {
         "id": "xai-profile",
         "label": "profile xAI",
         "auth_type": "oauth",
         "priority": 0,
         "source": "manual:device_code",
-        "access_token": "profile-access",
+        "access_token": profile_access,
         "refresh_token": "profile-refresh",
     }
     root_entry = {
         **profile_entry,
         "id": "xai-root",
         "label": "root xAI",
-        "access_token": "root-access",
+        "access_token": root_access,
         "refresh_token": "root-refresh",
     }
     _write_store(
@@ -381,7 +418,7 @@ def test_profile_owned_xai_pool_refresh_stays_in_profile(profile_and_root, monke
     )
 
     def fake_refresh(access_token, refresh_token, **_kwargs):
-        assert access_token == "profile-access"
+        assert access_token == profile_access
         assert refresh_token == "profile-refresh"
         assert getattr(A._auth_lock_holder_for(profile_path), "depth", 0) > 0
         return {
@@ -542,6 +579,7 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
         }
 
     monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
+    monkeypatch.setattr(auth_codex, "refresh_codex_oauth_pure", fake_refresh)
 
     entry = _entry(
         provider,
@@ -643,3 +681,110 @@ def test_write_through_fires_on_every_refresh_not_just_first(
     )
     assert root_tokens["refresh_token"] == "rf2"
 
+
+def test_hermes_pkce_refresh_writes_back_to_singleton(tmp_path, monkeypatch):
+    """A successful hermes_pkce refresh must update
+    ~/.hermes/.anthropic_oauth.json, or ``_seed_from_singletons()`` on the
+    next ``load_pool()`` re-seeds the pre-refresh (already-consumed,
+    single-use) token pair over the freshly rotated one.
+    """
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+
+    oauth_file = hermes_home / ".anthropic_oauth.json"
+    oauth_file.write_text(
+        json.dumps({"accessToken": "sk-ant-oat-rt0", "refreshToken": "rt0", "expiresAt": 0}),
+        encoding="utf-8",
+    )
+    _write_store(hermes_home / "auth.json", {"version": 1, "providers": {}})
+
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
+        lambda refresh_token, use_json=False: {
+            "access_token": "sk-ant-oat-rt1",
+            "refresh_token": "rt1",
+            "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+        },
+    )
+    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
+
+    entry = PooledCredential(
+        provider="anthropic",
+        id="pool-entry",
+        label="cred",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="hermes_pkce",
+        access_token="sk-ant-oat-rt0",
+        refresh_token="rt0",
+    )
+    pool = CredentialPool("anthropic", [entry])
+    updated = pool._refresh_entry(entry, force=True)
+    assert updated is not None
+    assert updated.refresh_token == "rt1"
+
+    on_disk = json.loads(oauth_file.read_text(encoding="utf-8"))
+    assert on_disk["refreshToken"] == "rt1", (
+        "successful hermes_pkce refresh must write back to "
+        "~/.hermes/.anthropic_oauth.json, or _seed_from_singletons() will "
+        "revert the pool entry to the pre-refresh (spent) token on next load"
+    )
+
+    reloaded = load_pool("anthropic")
+    reloaded_entries = [e for e in reloaded.entries() if e.source.endswith("hermes_pkce")]
+    assert reloaded_entries, "hermes_pkce entry should still be present after reload"
+    assert reloaded_entries[0].refresh_token == "rt1", (
+        "regression: fresh load_pool() re-seeded the pre-refresh refresh "
+        "token from the stale singleton file, reverting a successful "
+        "rotation and orphaning the already-consumed rt0"
+    )
+
+
+def test_manual_hermes_pkce_refresh_does_not_create_duplicate_singleton(
+    tmp_path, monkeypatch
+):
+    """A pool-owned manual:hermes_pkce entry must not create a second source."""
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.auth.is_provider_explicitly_configured", lambda pid: True)
+    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr(
+        "agent.anthropic_credentials.refresh_anthropic_oauth_pure",
+        lambda refresh_token, use_json=False: {
+            "access_token": "manual-at-1",
+            "refresh_token": "manual-rt-1",
+            "expires_at_ms": int(time.time() * 1000) + 3_600_000,
+        },
+    )
+    _write_store(hermes_home / "auth.json", {"version": 1, "providers": {}})
+
+    entry = PooledCredential(
+        provider="anthropic",
+        id="manual-entry",
+        label="cred",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:hermes_pkce",
+        access_token="manual-at-0",
+        refresh_token="manual-rt-0",
+        expires_at_ms=0,
+    )
+    pool = CredentialPool("anthropic", [entry])
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert refreshed.refresh_token == "manual-rt-1"
+    oauth_file = hermes_home / ".anthropic_oauth.json"
+    assert not oauth_file.exists(), (
+        "manual:hermes_pkce is already pool-owned; refreshing it must not "
+        "create a second hermes_pkce singleton source"
+    )
+
+    reloaded = load_pool("anthropic")
+    matching = [e for e in reloaded.entries() if e.id == "manual-entry"]
+    assert len(matching) == 1
+    assert matching[0].source == "manual:hermes_pkce"
+    assert matching[0].refresh_token == "manual-rt-1"

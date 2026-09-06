@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from tools import delegate_tool
+import pytest
+
+from tools import delegate_tool_config as delegate_tool
 
 
 def test_delegation_base_url_with_provider_resolves_provider_key(monkeypatch):
@@ -62,6 +64,8 @@ def test_delegation_base_url_without_provider_keeps_parent_key_inheritance():
         "base_url": "http://localhost:11434/v1",
         "api_key": None,
         "api_mode": "chat_completions",
+        "request_overrides": None,
+        "max_output_tokens": None,
     }
 
 
@@ -93,3 +97,18 @@ def test_delegation_base_url_provider_honors_explicit_api_mode(monkeypatch):
 
     assert resolved["api_key"] == "ollama-key"
     assert resolved["api_mode"] == "codex_responses"
+
+
+@pytest.mark.parametrize("resolution_error", [False, True])
+def test_named_endpoint_never_falls_back_to_parent_key(monkeypatch, resolution_error):
+    def resolve(**kwargs):
+        if resolution_error:
+            raise RuntimeError("provider not configured")
+        return {"provider": "ollama-cloud", "api_key": ""}
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+    with pytest.raises(ValueError, match="ollama-cloud"):
+        delegate_tool._resolve_delegation_credentials(
+            {"provider": "ollama-cloud", "base_url": "https://ollama.com/v1"},
+            parent_agent=object(),
+        )
