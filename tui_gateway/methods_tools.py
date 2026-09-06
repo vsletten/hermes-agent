@@ -1171,6 +1171,22 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"servers": [_mcp_summarize_server(name, cfg) for name, cfg in sorted(servers.items())]})
 
 
+@_mcp_rpc("status", required=())
+def _(rid, params: dict) -> dict:
+    """``{servers: [{name, transport, tools, connected, disabled, status}], checked_at}`` from cached
+    runtime state; never connects, probes, or starts auth. Under a multiplexer the runtime view is the
+    scoped profile's; otherwise it is shown only when ``profile`` is the launch profile."""
+    import time
+    hc = _tools_mod("hermes_constants")
+    configured = _tools_mod("hermes_cli.mcp_config")._get_mcp_servers()
+    include_runtime = (_tools_mod("agent.secret_scope").is_multiplex_active()
+                       or hc.hermes_home_key() == hc.hermes_home_key(hc.get_process_hermes_home()))
+    safe = ("name", "transport", "tools", "connected", "disabled", "status")
+    servers = _tools_mod("tools.mcp_tool_discovery").get_mcp_status(configured, include_runtime=include_runtime)
+    return _ok(rid, {"servers": [{k: e[k] for k in safe if k in e} for e in servers],
+                     "checked_at": int(time.time() * 1000)})
+
+
 @_mcp_rpc("add")
 def _(rid, params: dict) -> dict:
     """Add ``name`` from ``preset`` (catalog id) and/or ``config`` (url/command/args/env/headers/auth/
