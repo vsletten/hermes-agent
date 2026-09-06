@@ -1,6 +1,8 @@
 """Local-only updater contract tests: real Git histories, fake Hermes installer."""
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -106,17 +108,56 @@ class UpdaterTests(unittest.TestCase):
         self.assertFalse(self.logfile.exists())
         self.assertEqual(len(list((self.root / "candidates").iterdir())), 1)
 
-    def test_atomic_rejection_preserves_both_remote_branches_and_install(self):
-        # Remote WIP diverges from the local install without being part of main.
+    def test_existing_remote_current_branch_commits_are_preserved(self):
         self.git("switch", "-c", "remote-only")
         self.commit("remote", "another worker's change")
         self.git("push", "origin", "HEAD:refs/heads/wip/local-customizations")
+        remote_head = self.git("rev-parse", "HEAD").strip()
         self.git("switch", "wip/local-customizations")
-        before = self.git("ls-remote", "origin", "refs/heads/main", "refs/heads/wip/local-customizations")
+        # Both sides have unique commits, so preserving only local HEAD is insufficient.
+        self.commit("second-local", "another local customization")
+        local_head = self.git("rev-parse", "HEAD").strip()
+        result = self.update("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for ancestor in (remote_head, local_head, self.upstream_head):
+            self.git("merge-base", "--is-ancestor", ancestor, "HEAD")
+        candidate = self.git("rev-parse", "HEAD").strip()
+        for branch in ("main", "wip/local-customizations"):
+            self.assertIn(candidate, self.git("ls-remote", "origin", "refs/heads/" + branch))
+
+    def test_atomic_rejection_preserves_both_remote_branches_and_install(self):
+        # A writer advances the remote only after this updater captured its inputs.
+        self.git("switch", "-c", "remote-only")
+        self.commit("remote", "concurrent writer's change")
+        remote_head = self.git("rev-parse", "HEAD").strip()
+        self.git("switch", "wip/local-customizations")
+        self.git("push", "origin", "HEAD:refs/heads/wip/local-customizations")
+        main_before = self.git("ls-remote", "origin", "refs/heads/main")
+        self.env["HERMES_UPDATE_TEST_COMMAND"] = (
+            "git push origin " + remote_head + ":refs/heads/wip/local-customizations"
+        )
         result = self.update("--apply")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/main", "refs/heads/wip/local-customizations"), before)
+        self.assertEqual(self.git("ls-remote", "origin", "refs/heads/main"), main_before)
+        self.assertIn(remote_head, self.git("ls-remote", "origin", "refs/heads/wip/local-customizations"))
         self.assertEqual(self.git("rev-parse", "HEAD").strip(), self.original)
+        self.assertFalse(self.logfile.exists())
+
+    def test_remote_current_lookup_failure_is_not_treated_as_missing(self):
+        before = self.git("ls-remote", "origin")
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        git_proxy = bin_dir / "git"
+        git_proxy.write_text(
+            '#!/bin/bash\nif [[ " $* " == *" ls-remote --exit-code "* ]]; then exit 128; fi\n'
+            'exec ' + shlex.quote(shutil.which("git")) + ' "$@"\n'
+        )
+        git_proxy.chmod(0o755)
+        self.env["PATH"] = str(bin_dir) + os.pathsep + self.env["PATH"]
+        result = self.update("--apply")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Could not inspect remote install branch", result.stderr)
+        self.assertEqual(self.git("ls-remote", "origin"), before)
         self.assertFalse(self.logfile.exists())
 
     def test_dirty_install_refuses_before_any_remote_writes(self):

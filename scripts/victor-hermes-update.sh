@@ -11,7 +11,7 @@ ORIGIN_REMOTE="${HERMES_ORIGIN_REMOTE:-origin}"
 BRANCH="${HERMES_BRANCH:-main}"
 TMP_ROOT="${HERMES_UPDATE_WORKTREE_ROOT:-$HOME/.hermes/update-worktrees}"
 # Override with HERMES_UPDATE_TEST_COMMAND='scripts/run_tests.sh' for the full suite.
-DEFAULT_TEST_COMMAND='scripts/run_tests.sh tests/scripts/test_victor_hermes_update.py tests/agent/test_credential_pool_oauth_writethrough.py tests/agent/transports/test_codex_app_server_runtime.py tests/agent/transports/test_codex_app_server_session.py tests/hermes_cli/test_kanban_db.py tests/hermes_cli/test_overlay.py tests/hermes_cli/test_overlay_cli.py tests/hermes_cli/test_voice_wrapper.py tests/run_agent/test_codex_app_server_integration.py tests/tools/test_delegate_credentials.py tests/tools/test_voice_cli_integration.py tests/tools/test_voice_stop_phrase.py'
+DEFAULT_TEST_COMMAND='scripts/run_tests.sh tests/scripts/test_victor_hermes_update.py tests/agent/test_credential_pool_oauth_writethrough.py tests/agent/transports/test_codex_app_server_runtime.py tests/agent/transports/test_codex_app_server_session.py tests/hermes_cli/test_kanban_db.py tests/hermes_cli/test_overlay.py tests/hermes_cli/test_overlay_cli.py tests/hermes_cli/test_voice_wrapper.py tests/run_agent/test_codex_app_server_integration.py tests/tools/test_delegate_credentials.py tests/tools/test_voice_cli_integration.py tests/tools/test_voice_stop_phrase.py tests/cron/test_execution_ledger.py tests/cron/test_cron_workdir.py tests/cron/test_cronjob_schema.py tests/cron/test_inflight_stale_guard.py tests/tools/test_cronjob_run_background.py tests/tools/test_cronjob_list_execution_state.py tests/hermes_cli/test_setup_agent_settings.py tests/hermes_cli/test_kanban_review_lifecycle.py'
 TEST_COMMAND="${HERMES_UPDATE_TEST_COMMAND:-$DEFAULT_TEST_COMMAND}"
 APPLY=0
 SKIP_TESTS=0
@@ -84,6 +84,7 @@ fi
 
 log "Install: $REPO ($current_branch @ $install_head)"
 log "Merge $ORIGIN_REMOTE/$BRANCH and $UPSTREAM_REMOTE/$BRANCH into the committed install HEAD."
+[[ "$current_branch" == "$BRANCH" ]] || log "Include $ORIGIN_REMOTE/$current_branch when that branch exists."
 log "Validate with: $TEST_COMMAND"
 if [[ "$NO_PUSH" == 1 ]]; then
   log 'Retain candidate after validation; no remote writes or installation.'
@@ -96,6 +97,16 @@ fi
 
 run git -C "$REPO" fetch "$ORIGIN_REMOTE" "refs/heads/$BRANCH:refs/remotes/$ORIGIN_REMOTE/$BRANCH"
 run git -C "$REPO" fetch "$UPSTREAM_REMOTE" "refs/heads/$BRANCH:refs/remotes/$UPSTREAM_REMOTE/$BRANCH"
+remote_current_exists=0
+if [[ "$current_branch" != "$BRANCH" ]]; then
+  if git -C "$REPO" ls-remote --exit-code --heads "$ORIGIN_REMOTE" "refs/heads/$current_branch" >/dev/null; then
+    run git -C "$REPO" fetch "$ORIGIN_REMOTE" "refs/heads/$current_branch:refs/remotes/$ORIGIN_REMOTE/$current_branch"
+    remote_current_exists=1
+  else
+    lookup_status=$?
+    [[ "$lookup_status" == 2 ]] || die "Could not inspect remote install branch (git exit $lookup_status)."
+  fi
+fi
 stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 backup_branch="codex/hermes-pre-update-$stamp"
 run git -C "$REPO" update-ref "refs/heads/$backup_branch" "$install_head"
@@ -108,6 +119,9 @@ TMP_WORKTREE="$(mktemp -d "$TMP_ROOT/victor-hermes-update.XXXXXX")"
 TMP_BRANCH="codex/hermes-update-$stamp"
 run git -C "$REPO" worktree add -b "$TMP_BRANCH" "$TMP_WORKTREE" "$install_head"
 run git -C "$TMP_WORKTREE" merge --no-edit "$ORIGIN_REMOTE/$BRANCH"
+if [[ "$remote_current_exists" == 1 ]]; then
+  run git -C "$TMP_WORKTREE" merge --no-edit "$ORIGIN_REMOTE/$current_branch"
+fi
 run git -C "$TMP_WORKTREE" merge --no-edit "$UPSTREAM_REMOTE/$BRANCH"
 candidate="$(git -C "$TMP_WORKTREE" rev-parse HEAD)"
 if [[ "$SKIP_TESTS" == 1 ]]; then
