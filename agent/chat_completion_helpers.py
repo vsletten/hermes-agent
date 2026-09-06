@@ -1063,6 +1063,12 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     idle_default = next(
         (default for threshold, default in ((100_000, 180.0), (50_000, 120.0), (10_000, 60.0)) if est_tokens > threshold),
         12.0)
+    if codex and not openai_codex_backend:
+        # xAI Grok (and other non-Codex Responses backends) can sit silent for minutes after the
+        # opening SSE frame while reasoning and emit no Codex-style in_progress keepalives, so the
+        # Codex idle buckets (12/60/120s) force-close a healthy stream (httpx surfaces EPIPE) and a
+        # 3-retry cron budget dies in ~3 minutes. Floor the idle default at 300s for those backends.
+        idle_default = max(idle_default, 300.0)
 
     # No-event TTFB cutoff. Default 120s: the SDK's own read timeout is 600s,
     # and a tight 12s killed subscription-backed requests mid-prefill.
