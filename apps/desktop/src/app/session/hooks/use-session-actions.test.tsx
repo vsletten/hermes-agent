@@ -67,7 +67,7 @@ import {
 } from '@/store/session'
 import { $removedSessionIds, $sessionMutationsInFlight } from '@/store/session-removal'
 import { requestForSessionProfile, type SessionProfileRoute } from '@/store/session-request-router'
-import { $sessionTiles, sessionTileOwnerRoute } from '@/store/session-states'
+import { $sessionTiles, resetTileRuntimeBindings, sessionTileOwnerRoute } from '@/store/session-states'
 import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
@@ -4090,6 +4090,59 @@ describe('createBackendSessionForSend workspace target', () => {
     )
 
     expect(params).not.toHaveProperty('cwd')
+  })
+})
+
+describe('fresh tile reconnect isolation', () => {
+  afterEach(() => {
+    cleanup()
+    $newChatRoute.set(null)
+    $newChatProfile.set(null)
+    $sessionTiles.set([])
+    setSessions([])
+    vi.restoreAllMocks()
+  })
+
+  it.each([false, true])('keeps the creating owner across unrelated reconnects (listed=%s)', async listed => {
+    const owner: SessionProfileRoute = { connectionId: 'local', mode: 'local', profile: 'default' }
+    const other = { ...owner, profile: 'background' }
+    const stored = `fresh-tile-${listed}`
+    $sessionTiles.set([])
+    $newChatRoute.set(owner)
+    const ambientRequest = vi.fn(async () => ({}) as never)
+
+    vi.mocked(requestGatewayForAgent).mockImplementation(async (_connectionId, _profile, method) => {
+      if (method === 'session.create') {
+        // The picker can change while create is in flight; ownership cannot.
+        $newChatRoute.set(other)
+
+        return { session_id: RUNTIME_SESSION_ID, stored_session_id: stored } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={ambientRequest} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+    await act(async () => {
+      await handle!.openNewSessionTile('center', { listed })
+    })
+
+    expect($sessionTiles.get().find(tile => tile.storedSessionId === stored)?.runtimeId).toBe(RUNTIME_SESSION_ID)
+    act(() => resetTileRuntimeBindings(other))
+    expect($sessionTiles.get().find(tile => tile.storedSessionId === stored)?.runtimeId).toBe(RUNTIME_SESSION_ID)
+    expect(sessionTileOwnerRoute(stored)).toEqual(owner)
+    expect(requestGatewayForAgent).toHaveBeenCalledWith(
+      owner.connectionId,
+      owner.profile,
+      'session.create',
+      expect.anything()
+    )
+    expect(ambientRequest).not.toHaveBeenCalledWith('session.create', expect.anything())
+
+    act(() => resetTileRuntimeBindings(owner))
+    expect($sessionTiles.get().find(tile => tile.storedSessionId === stored)?.runtimeId).toBeUndefined()
   })
 })
 

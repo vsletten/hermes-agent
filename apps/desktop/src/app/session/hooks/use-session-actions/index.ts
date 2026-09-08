@@ -753,7 +753,12 @@ export function useSessionActions({
         // occupied (openTab path for "New session in Home").
         const capturedRoute = options?.route !== undefined ? options.route : resolveNewChatOwnerRoute(options?.profile)
 
-        const workspaceScope = options?.workspaceScope ?? { workspaceMode: 'sessions' }
+        // Bind the tile to the socket that creates it, not just the owner hint.
+        // Otherwise an unrelated profile reconnect clears this healthy runtime.
+        const workspaceScope = {
+          ...(options?.workspaceScope ?? { workspaceMode: 'sessions' as const }),
+          ...(capturedRoute ? { ownerRoute: capturedRoute } : {})
+        }
 
         const cwd =
           options?.cwd === null ? '' : typeof options?.cwd === 'string' ? options.cwd.trim() : resolveNewSessionCwd()
