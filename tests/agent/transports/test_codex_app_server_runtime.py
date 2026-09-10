@@ -267,6 +267,13 @@ class TestSpawnEnvIsolation:
         )
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
+        # The extra writable roots do not grant native shell descendants the
+        # worker's identity; only the managed Hermes endpoint gets that scope.
+        assert "HERMES_KANBAN_TASK" not in captured["env"]
+        assert captured["env"]["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+        assert captured["env"]["HERMES_KANBAN_DB"].endswith("/smoke/kanban.db")
+        assert 'mcp_servers.hermes-mcp.env.HERMES_KANBAN_TASK="t_smoke"' in cmd
+        assert 'mcp_servers.hermes-mcp.env.HERMES_DELEGATED_CHILD_CONTEXT=""' in cmd
 
 
 class TestSpawnEnvSecretStripping:
@@ -343,4 +350,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-

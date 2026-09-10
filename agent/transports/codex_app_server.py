@@ -108,27 +108,27 @@ class CodexAppServerClient:
         if codex_home:
             spawn_env["CODEX_HOME"] = codex_home
 
-        app_server_args = list(extra_args or [])
-        # Kanban workers must be able to write their handoff/status back to
-        # the board DB, and Project Autopilot tasks may also need the linked
-        # project home outside the per-task workspace. Keep the Codex sandbox
-        # on and add only these narrow extra writable roots. If a task needs
-        # some other external root, it should block for human intervention
-        # instead of creating fallback clones or widening permissions.
-        if spawn_env.get("HERMES_KANBAN_TASK"):
+        cmd = [codex_bin, "app-server", *(extra_args or [])]
+        from agent.delegation_context import (
+            DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS,
+            delegated_child_subprocess_env, is_dispatcher_owned_worker_context,
+        )
+        # Grant worker scope only to the managed MCP endpoint; native shell
+        # descendants retain board routing but cannot mutate the worker's task.
+        owned_task = os.environ.get("HERMES_KANBAN_TASK") and is_dispatcher_owned_worker_context()
+        if owned_task:
+            for key in (*KANBAN_ENV_KEYS, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+                if key in os.environ:
+                    cmd += ["-c", f"mcp_servers.hermes-mcp.env.{key}={json.dumps(os.environ[key])}"]
+            cmd += ["-c", f'mcp_servers.hermes-mcp.env.{DELEGATED_CHILD_ENV_MARKER}=""']
+            # Preserve the fork's narrow board and Project Autopilot roots.
             writable_roots_json = json.dumps(_codex_workspace_write_roots(spawn_env))
-            app_server_args.extend(
-                [
-                    "-c",
-                    'sandbox_mode="workspace-write"',
-                    "-c",
-                    f"sandbox_workspace_write.writable_roots={writable_roots_json}",
-                    "-c",
-                    "sandbox_workspace_write.network_access=false",
-                ]
-            )
-
-        cmd = [codex_bin, "app-server"] + app_server_args
+            cmd += [
+                "-c", 'sandbox_mode="workspace-write"',
+                "-c", f"sandbox_workspace_write.writable_roots={writable_roots_json}",
+                "-c", "sandbox_workspace_write.network_access=false",
+            ]
+        spawn_env = delegated_child_subprocess_env(spawn_env)
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 

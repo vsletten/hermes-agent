@@ -65,7 +65,6 @@ def test_delegation_base_url_without_provider_keeps_parent_key_inheritance():
         "api_key": None,
         "api_mode": "chat_completions",
         "request_overrides": None,
-        "max_output_tokens": None,
     }
 
 

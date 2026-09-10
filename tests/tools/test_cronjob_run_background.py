@@ -120,7 +120,7 @@ class TestBackgroundDispatch:
             assert res["claimed"] is True
             assert res["dispatched"] is True
             assert res["delegation_id"]
-            m_claim.assert_called_once_with("job-bg-01", return_job=True)
+            m_claim.assert_called_once_with("job-bg-01", manual=True, return_job=True)
         finally:
             run_release.set()
 
@@ -347,7 +347,7 @@ class TestInFlightDedupe:
                 _try_dispatch_background_run(_job("job-bg-sweep"))
 
         sweep.assert_called_once()
-        claim.assert_called_once_with("job-bg-sweep", return_job=True)
+        claim.assert_called_once_with("job-bg-sweep", manual=True, return_job=True)
 
     def test_ticker_guard_uses_shared_helpers(self):
         """The ticker's _submit_with_guard and manual runs share ONE dedupe
@@ -398,5 +398,5 @@ class TestCronjobRunToolIntegration:
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
-        m_claim.assert_called_once_with("job-bg-13", return_job=True)
+        m_claim.assert_called_once_with("job-bg-13", manual=True, return_job=True)
         m_run.assert_called_once()
