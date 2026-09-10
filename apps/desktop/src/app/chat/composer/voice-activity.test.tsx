@@ -9,6 +9,7 @@ describe('getElementAnalyser', () => {
 
   it('does not attach a media element source while the audio context is suspended', () => {
     const createMediaElementSource = vi.fn(() => ({ connect: vi.fn() }))
+
     const createAnalyser = vi.fn(() => ({
       connect: vi.fn(),
       fftSize: 0,
@@ -16,6 +17,7 @@ describe('getElementAnalyser', () => {
       getByteFrequencyData: vi.fn(),
       smoothingTimeConstant: 0
     }))
+
     const resume = vi.fn(() => Promise.resolve())
 
     class SuspendedAudioContext {
