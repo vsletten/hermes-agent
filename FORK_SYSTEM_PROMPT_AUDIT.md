@@ -76,10 +76,11 @@ Notable prompt-history evidence:
 1. Removed the installed repository's `upstream` remote.
 2. Replaced `~/.hermes/scripts/victor-hermes-update.sh` with a fail-closed kill switch.
 3. Replaced `~/.hermes/scripts/update-hermes-preserve-local-patches.sh` with a fail-closed kill switch.
-4. Set Honcho recall mode from `hybrid` to `tools`, stopping automatic memory prefetch while preserving explicit Honcho lookup tools.
-5. Set `agent.tool_use_enforcement` to `false`.
-6. Set `agent.execution_guidance` to `false`.
-7. Set `tools.tool_search.listing` to `off`.
+4. Replaced the fork's tracked `scripts/victor-hermes-update.sh` with the same fail-closed policy and pinned it with a regression test.
+5. Set Honcho recall mode from `hybrid` to `tools`, stopping automatic memory prefetch while preserving explicit Honcho lookup tools.
+6. Set `agent.tool_use_enforcement` to `false`.
+7. Set `agent.execution_guidance` to `false`.
+8. Set `tools.tool_search.listing` to `off`.
 
 ## Durable fork changes on `fix/prompt-amputation`
 
@@ -89,7 +90,7 @@ Notable prompt-history evidence:
 4. Memory guidance is shorter and no longer declares that skills always come first.
 5. Tests pin the new direct-work behavior and lean defaults.
 
-Validation result: `471 passed, 1 skipped, 1 deselected`. The deselected Anthropic interrupt test requires the optional `anthropic` package missing from the installed environment and is unrelated to these changes.
+Validation result: `472 passed, 1 skipped, 1 deselected`. The deselected Anthropic interrupt test requires the optional `anthropic` package missing from the installed environment and is unrelated to these changes.
 
 ## Next cuts, in order
 
