@@ -68,13 +68,13 @@ def test_memory_guidance_respects_available_writes(stores, names, monkeypatch, t
                         _memory_enabled=stores[0], _user_profile_enabled=stores[1])
     prompt = build_system_prompt(agent)
     enabled = "memory" in names and any(stores)
-    assert ("Memory is the narrow exception" in prompt) == enabled
-    assert ("(skill_manage)" in prompt) == (enabled and "skill_manage" in names)
+    assert ("Memory is for facts that apply across sessions" in prompt) == enabled
+    assert ("may be preserved in skills" in prompt) == (enabled and "skill_manage" in names)
     if enabled:
-        assert "EVERY session regardless of task" in prompt
-        assert "procedures and workflows belong in skills" in prompt
+        assert "stable environment facts" in prompt
+        assert "Temporary task state belongs in session history" in prompt
         if "skill_manage" not in names:
-            assert "not in memory" in prompt
+            assert "belong in skills rather than global memory" in prompt
     if enabled and not stores[0]:
         assert "never target='memory'" in prompt
 

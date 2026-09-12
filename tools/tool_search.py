@@ -43,7 +43,7 @@ class ToolSearchConfig:
     threshold_pct: float  # 0..100
     search_default_limit: int
     max_search_limit: int
-    listing: str = "auto"  # "auto"/"on" = embed the manifest when it fits; "off" = bare bridge
+    listing: str = "off"  # keep the bridge lean; discover capabilities by search when needed
     listing_max_tokens: int = 4000  # budget = min(this, threshold_pct% of context)
     # None = curated default; an explicit list replaces it wholesale ([] = defer no core tools).
     defer_tools: Optional[frozenset] = None
@@ -66,7 +66,7 @@ class ToolSearchConfig:
             search_default_limit=_clamped_int(
                 raw.get("search_default_limit"), 5, 1, max_search_limit),
             max_search_limit=max_search_limit,
-            listing=_tri_state(raw.get("listing", "auto")),
+            listing=_tri_state(raw.get("listing", "off")),
             listing_max_tokens=_clamped_int(raw.get("listing_max_tokens"), 4000, 200, 60000),
             defer_tools=(frozenset(str(n).strip() for n in defer_raw if str(n).strip())
                          if isinstance(defer_raw, (list, tuple, set)) else None))

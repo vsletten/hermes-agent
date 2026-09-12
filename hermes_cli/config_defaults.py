@@ -120,16 +120,10 @@ DEFAULT_CONFIG = {
         # turn), "cold" (first turn of a session only).
         "service_tier": "",
         "fast_auto_seconds": 60,
-        # System-prompt guidance telling the model to call tools instead of describing actions.
-        # "auto" = gpt/codex models; true/false = force for all models; or a list of model-name
-        # substrings (e.g. ["gpt", "codex", "gemini", "qwen"]).
-        "tool_use_enforcement": "auto",
-        # Execution-discipline prompt block (tool persistence, tools for arithmetic/system facts,
-        # read-back after external writes, count reconciliation, literal identifiers,
-        # verification-gated completion). Chosen once per session by model name (byte-stable).
-        # "auto" = gpt/codex/grok/deepseek/kimi/qwen/glm/minimax/mimo/mistral; true/false = force;
-        # or a list of model-name substrings.
-        "execution_guidance": "auto",
+        # Optional legacy system-prompt blocks. Disabled by default because broad process coaching
+        # degrades capable models on simple tasks; true or a model-name list remains available for weak models.
+        "tool_use_enforcement": False,
+        "execution_guidance": False,
         # When the model narrates an action ("I'll go check the logs...") but emits no tool call,
         # inject a "continue now, execute the tools" nudge and loop (max 2 nudges/turn). Corrective
         # sibling of tool_use_enforcement. "auto" = codex_responses api_mode only; true = all
@@ -1805,11 +1799,9 @@ DEFAULT_CONFIG = {
             "search_default_limit": 5,
             # Hard upper bound the model may request via `limit` (per query). Range 1..50.
             "max_search_limit": 25,
-            # Catalog listing embedded in the bridge description (name + first sentence ≤60 chars,
-            # grouped by server/toolset). "auto" = include when it fits (falls back to names-only,
-            # then bare tier-2 bridge); "on" = same rendering, explicit intent; "off" = always the
-            # bare bridge.
-            "listing": "auto",
+            # Keep the bridge description bare by default. Dumping the entire deferred catalog into every
+            # request is prompt noise; the model can search by capability when it actually needs one.
+            "listing": "off",
             # Absolute cap on the embedded listing in tokens (chars/4), regardless of context size.
             # Range 200..60000.
             "listing_max_tokens": 4000,

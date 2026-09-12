@@ -864,8 +864,8 @@ class TestBuildSystemPrompt:
     def test_memory_guidance_when_memory_tool_loaded(self, agent_with_memory_tool):
         agent_with_memory_tool._memory_enabled = True
         prompt = agent_with_memory_tool._build_system_prompt()
-        assert "Memory is the narrow exception" in prompt
-        assert "(skill_manage)" not in prompt
+        assert "Memory is for facts that apply across sessions" in prompt
+        assert "may be preserved in skills" not in prompt
 
     def test_no_memory_guidance_when_both_builtin_stores_disabled(
         self, agent_with_memory_tool
@@ -1112,15 +1112,11 @@ class TestExecutionGuidanceConfig:
             a.client = MagicMock()
             return a
 
-    def test_deepseek_gets_guidance_by_default(self):
+    def test_guidance_is_disabled_by_default(self):
         from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
-        agent = self._make_agent(model="deepseek/deepseek-v4-pro")
-        assert OPENAI_MODEL_EXECUTION_GUIDANCE in agent._build_system_prompt()
-
-    def test_gpt_still_gets_guidance(self):
-        from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE
-        agent = self._make_agent(model="openai/gpt-4.1")
-        assert OPENAI_MODEL_EXECUTION_GUIDANCE in agent._build_system_prompt()
+        for model in ("deepseek/deepseek-v4-pro", "openai/gpt-4.1"):
+            agent = self._make_agent(model=model)
+            assert OPENAI_MODEL_EXECUTION_GUIDANCE not in agent._build_system_prompt()
 
     def test_config_false_suppresses(self):
         from agent.prompt_builder import OPENAI_MODEL_EXECUTION_GUIDANCE

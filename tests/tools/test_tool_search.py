@@ -45,6 +45,7 @@ class TestConfigParsing:
         cfg = ToolSearchConfig.from_raw(None)
         assert cfg.enabled == "auto"
         assert cfg.threshold_pct == 5.0
+        assert cfg.listing == "off"
 
     def test_bool_true_maps_to_auto(self):
         from tools.tool_search import ToolSearchConfig
@@ -606,14 +607,14 @@ class TestCatalogListing:
     def test_config_defaults(self):
         from tools.tool_search import ToolSearchConfig
         cfg = ToolSearchConfig.from_raw(None)
-        assert cfg.listing == "auto"
+        assert cfg.listing == "off"
         assert cfg.listing_max_tokens == 4000
         # legacy bool shapes keep defaults too
-        assert ToolSearchConfig.from_raw(True).listing == "auto"
+        assert ToolSearchConfig.from_raw(True).listing == "off"
 
 
-    def test_default_listing_cap_bounds_fixed_catalog_overhead(self):
-        """The default manifest must not grow back to the old 20K-token cap."""
+    def test_default_listing_adds_no_fixed_catalog_overhead(self):
+        """The default bridge must not embed the deferred catalog."""
         from tools.registry import registry
         from tools.tool_search import (
             ToolSearchConfig,
@@ -639,10 +640,9 @@ class TestCatalogListing:
             if td["function"]["name"] == "tool_search"
         )
         description_tokens = estimate_tokens_from_schemas([search])
-        # Includes the bridge schema around the listing, so allow modest
-        # framing overhead above the 4K listing budget.
-        assert description_tokens < 4500
-        assert result.listing_form in {"names", "groups", "mixed"}
+        assert description_tokens < 500
+        assert result.listing_form == "none"
+        assert "lean_catalog_tool_0000" not in search["function"]["description"]
 
     def test_short_desc_first_sentence_and_clip(self):
         from tools.tool_search_catalog import _short_desc
