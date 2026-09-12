@@ -1312,10 +1312,11 @@ def _apply_agent_section(agent, _agent_cfg):
     agent.budget_warning_ratio = normalize_budget_warning_ratio(
         _agent_section.get("budget_warning_ratio")
     )
-    # Both: "auto" (model-list match), true, false, or list of model substrings; independent
-    # of each other (gates in agent/system_prompt.py).
-    agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
-    agent._execution_guidance = _agent_section.get("execution_guidance", "auto")
+    # Optional legacy prompt blocks. Disabled by default: piling generic process rules onto capable models
+    # causes instruction interference and turns straightforward work into procedural churn. Operators may
+    # still force either block with true or a list of model-name substrings.
+    agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", False)
+    agent._execution_guidance = _agent_section.get("execution_guidance", False)
 
     # Wall-clock run budget from config — only when the constructor arg was not given.
     if agent.run_budget_seconds is None:

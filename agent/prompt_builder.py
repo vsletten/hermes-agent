@@ -177,26 +177,16 @@ def build_memory_guidance(
             "memory tool (target='user') — the built-in notes store is disabled, so never target='memory'. "
         )
     skill_routing = (
-        "Skills come first: when you learn something while doing a task — a "
-        "procedure, a pitfall, and the user's preferences and corrections "
-        "for that kind of work — record it in the skill you used or built "
-        "for the task (skill_manage), where it loads only when relevant. "
+        "Task-specific procedures and lessons may be preserved in skills when they are genuinely reusable. "
         if skill_manage_available else
-        "Task-specific knowledge — procedures, pitfalls, and the user's preferences "
-        "and corrections for that kind of work — belongs in skills, not in memory, "
-        "even when skill writing is unavailable. "
+        "Task-specific procedures and lessons belong in skills rather than global memory. "
     )
     return frame + skill_routing + (
-        "Memory is the narrow exception for facts that apply to EVERY "
-        "session regardless of task (who the user is, environment facts, "
-        "standing conventions with no task home); it has a hard character "
-        "budget, so when it fills, replace or consolidate stale entries "
-        "rather than skipping the save. Write entries as declarative facts, "
-        "not instructions to yourself: 'User prefers concise responses' ✓ — "
-        "'Always respond concisely' ✗ (imperative phrasing gets re-read as "
-        "a directive in later sessions and can override the user's current "
-        "request). A fact stale within a week belongs in session history; "
-        "procedures and workflows belong in skills."
+        "Memory is for facts that apply across sessions: who the user is, stable environment facts, "
+        "and standing conventions. It has a hard character budget, so replace or consolidate stale entries "
+        "instead of accumulating duplicates. Write entries as declarative facts, not instructions: "
+        "'User prefers concise responses' ✓; 'Always respond concisely' ✗. "
+        "Temporary task state belongs in session history, not persistent memory."
     )
 
 
@@ -1300,8 +1290,6 @@ def _render_skills_index(
         "context, so their descriptions are omitted — the skills work "
         "normally and load with skill_view(name) as usual.)"
     ) if demoted else ""
-    # Don't name web_search when the session has no web tools (dangling reference).
-    _basic_tools = "terminal" if available_tools is not None and "web_search" not in available_tools else "web_search or terminal"
     index_lines = []
     for category in sorted(skills_by_category):
         entries = skills_by_category[category]
@@ -1317,23 +1305,13 @@ def _render_skills_index(
                 index_lines.append(f"    - {name}: {desc}" if desc else f"    - {name}")
     return (
         "## Skills\n"
-        "Before replying, scan the skills below. If a skill matches or is even partially relevant to your "
-        "task, you MUST load it with skill_view(name) and follow its instructions. Err on the side of "
-        "loading — it is always better to have context you don't need than to miss critical steps, pitfalls, "
-        "or established workflows. Skills contain specialized knowledge — API endpoints, tool-specific "
-        "commands, and proven workflows that outperform general-purpose approaches. Load the skill "
-        f"even if you think you could handle the task with basic tools like {_basic_tools}. "
-        "Skills also encode the user's preferred approach, conventions, and quality standards for tasks like "
-        "code review, planning, and testing — load them even for tasks you already know how to do, because "
-        "the skill defines how it should be done here.\n"
-        "If a skill has issues, fix it with skill_manage(action='patch').\n"
-        "After difficult/iterative tasks, offer to save as a skill. If a skill you loaded was missing steps, "
-        "had wrong commands, or needed pitfalls you discovered, update it before finishing.\n"
-        "\n"
+        "Skills are optional task-specific runbooks. Load one only when its description clearly matches and the task "
+        "needs specialized procedures or internal context. For simple or urgent tasks, act directly. Prefer the single "
+        "best match; load additional skills only for genuinely separate requirements. The user's explicit request "
+        "always outranks skill guidance.\n\n"
         "<available_skills>\n"
         + "\n".join(index_lines) + "\n"
-        "</available_skills>\n\n"
-        "Only proceed without loading a skill if genuinely none are relevant to the task."
+        "</available_skills>"
         + hidden_note
     )
 

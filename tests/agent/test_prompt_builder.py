@@ -61,25 +61,14 @@ def _drain_truncation_warnings():
 
 
 class TestGuidanceConstants:
-    def test_memory_guidance_keeps_form_rule_and_routing(self):
-        """Dieted (#95681): WHAT belongs in memory is the memory tool
-        schema's job (taught on every call). This block keeps only the
-        declarative-form rule and the staleness/skills routing."""
+    def test_memory_guidance_keeps_global_scope_narrow(self):
         from agent.prompt_builder import MEMORY_GUIDANCE
 
         assert "declarative facts" in MEMORY_GUIDANCE
-        assert "imperative phrasing" in MEMORY_GUIDANCE
-        assert "stale within a week" in MEMORY_GUIDANCE
-        # Skills are the default home for task-learned knowledge (incl. the
-        # user's preferences/corrections for that work); memory is the narrow
-        # every-session exception. The routing rule must LEAD, not trail.
-        assert MEMORY_GUIDANCE.index("Skills come first") < MEMORY_GUIDANCE.index("Memory is the narrow exception")
-        assert "preferences and corrections" in MEMORY_GUIDANCE
+        assert "Temporary task state belongs in session history" in MEMORY_GUIDANCE
+        assert "genuinely reusable" in MEMORY_GUIDANCE
+        assert "Skills come first" not in MEMORY_GUIDANCE
         assert "Save proactively" not in MEMORY_GUIDANCE
-        assert "workflows belong" in MEMORY_GUIDANCE
-        # The category/SKIP curricula must NOT be re-taught here.
-        assert "PR numbers" not in MEMORY_GUIDANCE
-        assert "tool quirks" not in MEMORY_GUIDANCE
 
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
@@ -311,7 +300,21 @@ class TestBuildSkillsSystemPrompt:
         yield
         clear_skills_system_prompt_cache(clear_snapshot=True)
 
+    def test_skills_are_optional_and_direct_work_wins(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "devops" / "watch-pr"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: watch-pr\ndescription: Watch a pull request\n---\n"
+        )
 
+        result = build_skills_system_prompt()
+
+        assert "Skills are optional" in result
+        assert "For simple or urgent tasks, act directly" in result
+        assert "Prefer the single best match" in result
+        assert "MUST load" not in result
+        assert "Err on the side of loading" not in result
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
