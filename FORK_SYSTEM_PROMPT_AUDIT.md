@@ -4,6 +4,8 @@
 
 This fork no longer accepts upstream changes. The `upstream` remote has been removed from the installed repository, and both local update wrappers now fail closed. Future changes are deliberate local commits pushed only to Victor's fork.
 
+A follow-up scan found no local LaunchAgent or Hermes cron job that invokes either updater, and no GitHub Actions workflow that synchronizes this fork from upstream. Scheduled workflows inherited from upstream are gated to `NousResearch/hermes-agent` where relevant and do not perform fork synchronization.
+
 ## Executive finding
 
 The regression is not evidence that the model lost the ability to perform simple work. The harness now surrounds the same model with several large, overlapping control layers that reward procedural activity over direct task completion.
