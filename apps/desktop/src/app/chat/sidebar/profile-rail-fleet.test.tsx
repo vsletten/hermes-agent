@@ -643,6 +643,27 @@ describe('ProfileRail fleet mode', () => {
     expect(container.querySelector('[data-slot="profile-rail-rest-square"]')).toBeNull()
   })
 
+  it('keeps the active local default selectable in the condensed menu alongside remote defaults', async () => {
+    armFleet()
+    activeConnectionId.set('local')
+    profiles.set([
+      { is_default: true, name: 'default' },
+      ...Array.from({ length: 11 }, (_, index) => ({ is_default: false, name: `p${index + 1}` }))
+    ])
+    await renderFleet()
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Profiles' }), { button: 0, ctrlKey: false })
+
+    const localDefault = await screen.findByRole('menuitemradio', { name: 'default' })
+    expect(localDefault.querySelector('.codicon-home')).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: 'default · Gateway A' })).toBeTruthy()
+    expect(screen.getByRole('menuitem', { name: 'default · Gateway B' })).toBeTruthy()
+
+    fireEvent.click(localDefault)
+    expect(selectProfile).toHaveBeenCalledWith('default')
+    expect(selectConnection).not.toHaveBeenCalled()
+  })
+
   it('keeps the device glyph on the This device row once the rail condenses', async () => {
     armFleet()
     profiles.set([

@@ -579,7 +579,7 @@ export function ProfileRail() {
             onImport={() => void runImportProfileFlow()}
             onSelect={selectProfile}
             onSelectRest={switchToRest}
-            profiles={named}
+            profiles={defaultProfile ? [defaultProfile, ...named] : named}
             restGroups={restGroups}
           />
         </div>
@@ -860,9 +860,8 @@ function ImportProfileButton({ label }: { label: string }) {
   )
 }
 
-// The condensed rail: every named profile in one compact menu. The trigger
-// shows the active profile (tinted initial + name); on default/all scope it
-// falls back to the placeholder since the left toggle pill carries that state.
+// The condensed rail: every active-gateway profile, including default, in one
+// compact menu. The trigger shows the active profile; all scope uses a placeholder.
 function ProfileDropdown({
   activeKey,
   colors,
@@ -908,7 +907,7 @@ function ProfileDropdown({
                 <ProfileGlyph
                   aria-hidden="true"
                   color={resolveProfileColor(activeProfile.name, colors)}
-                  isDefault={false}
+                  isDefault={activeProfile.is_default}
                   name={activeProfile.name}
                 />
                 <span className="truncate">{profileLabel(activeProfile)}</span>
@@ -998,7 +997,7 @@ function ProfileDropdownItem({
         value={name}
       >
         <span className="flex min-w-0 items-center gap-1.5">
-          <ProfileGlyph aria-hidden="true" color={color} isDefault={false} name={name} />
+          <ProfileGlyph aria-hidden="true" color={color} isDefault={name === 'default'} name={name} />
           <span className="truncate">{label}</span>
           {summary && !hideStatus && <ProfileStatusDot summary={summary} />}
         </span>
